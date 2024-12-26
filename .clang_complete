@@ -4,5 +4,5 @@
 -DAPL=0
 -DIBM=0
 -DLIN=1
--I./SDK/CHeaders/XPLM
--I./SDK/CHeaders/Widgets
+-I./xplane-sdk/CHeaders/XPLM
+-I./xplane-sdk/CHeaders/Widgets
