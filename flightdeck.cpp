@@ -23,6 +23,7 @@
 #include "XPLMUtilities.h"
 #include "XPLMDataAccess.h"
 #include "XPLMProcessing.h"
+#include "XPLMPlugin.h"
 
 const float EPS = 1e-4;
 
@@ -684,9 +685,45 @@ float gdl90_loop(float, float, int, void *) {
     return interval;
 }
 
+float orig_cloud_data[9];
+XPLMCommandRef ir_training_cmd;
+
+int toggle_ir_training(XPLMCommandRef, XPLMCommandPhase phase, void *) {
+    if (phase != xplm_CommandBegin) {
+        return 1;
+    }
+    XPLMCommandRef cmd_ref = XPLMFindCommand("sim/GPS/g1000n1_popup");
+    XPLMCommandOnce(cmd_ref);
+    cmd_ref = XPLMFindCommand("sim/GPS/g1000n3_popup");
+    XPLMCommandOnce(cmd_ref);
+    static const float cloud_ir[9] = {0.0, 10000.0, 11000.0, 10000.0, 11000.0, 21000.0, 6, 6, 6};
+    static XPLMDataRef cloud_refs[9];
+    for (int i = 0; i < 3; i++) {
+        static char buff[64];
+        sprintf(buff, "sim/weather/cloud_base_msl_m[%d]", i);
+        cloud_refs[i] = XPLMFindDataRef(buff);
+        sprintf(buff, "sim/weather/cloud_tops_msl_m[%d]", i);
+        cloud_refs[i + 3] = XPLMFindDataRef(buff);
+        sprintf(buff, "sim/weather/cloud_coverage[%d]", i);
+        cloud_refs[i + 6] = XPLMFindDataRef(buff);
+    }
+    if (XPLMGetDataf(cloud_refs[0]) < EPS) {
+        print_debug("foggles off...");
+        for (int i = 0; i < 9; i++) {
+            XPLMSetDataf(cloud_refs[i], orig_cloud_data[i]);
+        }
+    } else {
+        print_debug("foggles on...");
+        for (int i = 0; i < 9; i++) {
+            orig_cloud_data[i] = XPLMGetDataf(cloud_refs[i]);
+            XPLMSetDataf(cloud_refs[i], cloud_ir[i]);
+        }
+    }
+    return 0;
+}
 
 void menu_handler(void *inMenuRef, void *inItemRef) {
-    XPLMCommandRef cmd_ref = XPLMFindCommand((const char *)(inItemRef));
+    XPLMCommandRef cmd_ref = XPLMFindCommand("sim/operation/toggle_imc_foggles");
     XPLMCommandOnce(cmd_ref);
 }
 
@@ -715,13 +752,14 @@ PLUGIN_API int XPluginStart(char *outName,char *outSig, char *outDesc) {
     /* For each command, we set the item refcon to be the key command ID we wnat
      * to run.   Our callback will use this item refcon to do the right command.
      * This allows us to write only one callback for the menu. */
-    XPLMAppendMenuItem(myMenu, "Pause", (void *) "sim/operation/pause_toggle", 1);
+    XPLMAppendMenuItem(myMenu, "Toggle Foggles", NULL, 1);
     return 1;
 }
 
 PLUGIN_API void	XPluginStop() {}
 
 PLUGIN_API void XPluginDisable() {
+    XPLMUnregisterCommandHandler(ir_training_cmd, toggle_ir_training, false, NULL);
     XPLMDestroyFlightLoop(ctrl_loop_id);
     XPLMDestroyFlightLoop(data_loop_id);
     XPLMDestroyFlightLoop(gdl90_loop_id);
@@ -761,7 +799,12 @@ PLUGIN_API int XPluginEnable() {
     loop_cfg.callbackFunc = gdl90_loop;
     gdl90_loop_id = XPLMCreateFlightLoop(&loop_cfg);
     XPLMScheduleFlightLoop(gdl90_loop_id, -1, 1);
+
+    ir_training_cmd = XPLMCreateCommand(
+            "sim/operation/toggle_imc_foggles",
+            "Toggle IR training mode. This will toggle the outside vision (IMC and back to the original condition) and also toggle the G1000 PFD/MFD display.");
+    XPLMRegisterCommandHandler(ir_training_cmd, toggle_ir_training, false, NULL);
     return 1;
 }
 
-PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int, void*) {}
+PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int msg, void*) {}
