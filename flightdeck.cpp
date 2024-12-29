@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <string>
 #include <algorithm>
+#include <regex>
 
 #include <unistd.h>
 #include <sys/types.h>
@@ -19,11 +20,26 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
+#if IBM
+    #include <GL/wglew.h>
+    #include <Windows.h>
+#endif
+#if LIN
+    #include <GL/gl.h>
+#elif __GNUC__
+    #include <OpenGL/gl.h>
+#else
+    #include <gl/GL.h>
+#endif
+
 #include "XPLMMenus.h"
 #include "XPLMUtilities.h"
 #include "XPLMDataAccess.h"
 #include "XPLMProcessing.h"
 #include "XPLMPlugin.h"
+#include "XPLMGraphics.h"
+#include "XPLMDisplay.h"
+#include "XPLMNavigation.h"
 
 const float EPS = 1e-4;
 
@@ -162,6 +178,23 @@ struct DataSubscribeEvent: public Event {
         }
     }
 };
+
+/*
+struct TeleportEvent: public Event {
+    XPLMNavRef nav;
+
+    TeleportEvent(XPLMNavRef nav): nav(nav) {};
+    ~TeleportEvent() override {}
+
+    void handle() override {
+        XPLMNavType type;
+        float lat, lng, elev;
+        char name[128];
+        XPLMGetNavAidInfo(nav, &type, &lat, &lng, &elev, NULL, NULL, NULL, name, NULL);
+        print_debug("teleporting to %s(type=%d, lat=%.6f, lng=%.6f, elev=%.2f)", name, type, lat, lng, elev);
+    }
+};
+*/
 
 struct EventQueue {
     std::mutex lck;
@@ -388,8 +421,11 @@ struct GDL90: public UDPServer {
     }
 
     /// pasted from Garmin's GDL90 spec
-    static uint16_t crc16_table[256];
+    static uint16_t crc16_table[];
+    static bool crc_initialized;
     static void crc_init() {
+        if (crc_initialized) return;
+        crc_initialized = true;
         uint16_t crc;
         for (uint16_t i = 0; i < 256; i++) {
             crc = (i << 8);
@@ -576,6 +612,7 @@ struct GDL90: public UDPServer {
 };
 
 uint16_t GDL90::crc16_table[256];
+bool GDL90::crc_initialized = false;
 
 XPlaneS *xps = NULL;
 GDL90 *gdl90 = NULL;
@@ -722,47 +759,323 @@ int toggle_ir_training(XPLMCommandRef, XPLMCommandPhase phase, void *) {
     return 0;
 }
 
-void menu_handler(void *inMenuRef, void *inItemRef) {
-    XPLMCommandRef cmd_ref = XPLMFindCommand("sim/operation/toggle_imc_foggles");
-    XPLMCommandOnce(cmd_ref);
+struct GLWidget {
+    virtual bool is_inside(float x, float y) { return false; }
+    virtual void render(float x, float y, bool focused) = 0;
+    virtual void mark_rerender() {}
+    virtual void on_keypress(char key, XPLMKeyFlags flag) {}
+    virtual void on_mouse(XPLMMouseStatus status) {}
+    virtual void on_focus() {}
+};
+
+XPLMWindowID teleport_window = 0;
+std::vector<std::unique_ptr<GLWidget>> teleport_window_widgets;
+ssize_t teleport_window_widgets_focused = -1;
+std::unordered_map<std::string, XPLMNavRef> navaid_table;
+bool navaid_table_initialized = false;
+
+void navaid_table_init() {
+    if (navaid_table_initialized) return;
+    navaid_table_initialized = true;
+    auto nav = XPLMGetFirstNavAid();
+    char id[32];
+    while (nav != XPLM_NAV_NOT_FOUND) {
+        XPLMGetNavAidInfo(nav, NULL, NULL, NULL, NULL, NULL, NULL, id, NULL, NULL);
+        navaid_table[id] = nav;
+        nav = XPLMGetNextNavAid(nav);
+    }
 }
 
-PLUGIN_API int XPluginStart(char *outName,char *outSig, char *outDesc) {
-    XPLMMenuID myMenu;
-    int	mySubMenuItem;
+struct GLTextInput: GLWidget {
+    float l, r, t, b;
+    std::string text;
+    bool rerender;
 
+    GLTextInput(float x0, float y0, float w, float h): l(x0), r(x0 + w), t(y0 + h), b(y0), text(""), rerender(true) {}
+    void mark_rerender() override { rerender = true; }
+    bool is_inside(float x, float y) override {
+        return l < x && x < r && b < y && y < t; 
+    }
+    virtual bool verify_input(std::string &edited) {
+        std::transform(edited.begin(), edited.end(), edited.begin(), ::toupper);
+        return std::regex_match(edited, std::regex("[A-Z0-9.]*"));
+    }
+    void on_keypress(char key, XPLMKeyFlags flag) override {
+        if (!(flag & xplm_DownFlag)) {
+            return;
+        }
+        if (isprint(key)) {
+            auto edited = text + key;
+            if (verify_input(edited)) {
+                text = edited;
+            }
+        } else if (key == '\b' && text.length() > 0) {
+            text.resize(text.length() - 1);
+        }
+    }
+    void render(float x, float y, bool focused) override {
+        float col[3] = {1, 1, 1};
+        if (!rerender) {
+            return;
+        }
+        if (!focused) {
+            col[0] = 0.5;
+            col[1] = 0.5;
+            col[2] = 0.5;
+        }
+        glColor3fv(col);
+        glRectf(x + l, y + t, x + r, y + b);
+        float white[] = {0, 0, 0};
+        XPLMDrawString(white, x + l, y + t - 10, text.c_str(), nullptr, xplmFont_Proportional);
+    }
+};
+
+double get_elevation() {
+    auto alt_ref = XPLMFindDataRef("sim/flightmodel/position/elevation");
+    return XPLMGetDatad(alt_ref);
+}
+
+std::string to_string_with_precision(const double v, const int n = 4) {
+    std::ostringstream out;
+    out.precision(n);
+    out << std::fixed << v;
+    return std::move(out).str();
+}
+
+struct GLAltInput: public GLTextInput {
+    using GLTextInput::GLTextInput;
+
+    bool verify_input(std::string &edited) override {
+        return std::regex_match(edited, std::regex("[-0-9.]*"));
+    }
+
+    void on_focus() override {
+        if (text.length() == 0) {
+            text = to_string_with_precision(get_elevation() * 3.28084);
+            print_debug("here: %s", text.c_str());
+        }
+    }
+};
+
+struct GLButton: GLWidget {
+    float l, r, t, b;
+    std::string text;
+    bool down;
+    bool rerender;
+
+    GLButton(float x0, float y0, const char *text, float w): l(x0), r(x0 + w), t(y0 + 15), b(y0), text(text), down(false), rerender(true) {}
+    void mark_rerender() override { rerender = true; }
+    bool is_inside(float x, float y) override {
+        return l < x && x < r && b < y && y < t; 
+    }
+    void on_mouse(XPLMMouseStatus status) override {
+        switch (status) {
+            case xplm_MouseDown: {
+                down = true;
+                auto target_id = dynamic_cast<GLTextInput*>(teleport_window_widgets[1].get())->text.c_str();
+                XPLMNavType type;
+                float lat, lng, elev;
+                char name[256];
+                navaid_table_init();
+                auto it = navaid_table.find(target_id);
+                if (it != navaid_table.end()) {
+                    XPLMGetNavAidInfo(it->second, &type, &lat, &lng, &elev, NULL, NULL, NULL, name, NULL);
+                    print_debug("teleporting to %s(type=%d, lat=%.6f, lng=%.6f, elev=%.2f)", name, type, lat, lng, elev);
+                    double x, y, z;
+                    const std::string &alt_str = dynamic_cast<GLAltInput*>(teleport_window_widgets[3].get())->text;
+
+                    auto sim_speed_ref = XPLMFindDataRef("sim/time/sim_speed");
+                    XPLMSetDatai(sim_speed_ref, 0);
+
+                    size_t n;
+                    auto alt = std::stod(alt_str, &n);
+                    if (n != alt_str.length()) {
+                        alt = get_elevation();
+                    }
+                    XPLMWorldToLocal(lat, lng, alt, &x, &y, &z);
+                    auto local_x = XPLMFindDataRef("sim/flightmodel/position/local_x");
+                    auto local_y = XPLMFindDataRef("sim/flightmodel/position/local_y");
+                    auto local_z = XPLMFindDataRef("sim/flightmodel/position/local_z");
+                    XPLMSetDatad(local_x, x);
+                    XPLMSetDatad(local_y, y);
+                    XPLMSetDatad(local_z, z);
+                } else {
+                    print_debug("invalid navaid/fix ID: %s", target_id);
+                }
+            }
+            break;
+            case xplm_MouseUp: down = false; break;
+            case xplm_MouseDrag: down = true; break;
+        }
+    }
+    void render(float x, float y, bool) override {
+        float col[3] = {0.4218, 0.5391, 0.9297};
+        float white[] = {0, 0, 0};
+        if (!rerender) {
+            return;
+        }
+        if (down) {
+            for (auto &c: col) c = 1 - c;
+            for (auto &w: white) w = 1 - w;
+        }
+        glColor3fv(col);
+        glRectf(x + l, y + t, x + r, y + b);
+        XPLMDrawString(white, x + l + 10, y + t - 10, text.c_str(), nullptr, xplmFont_Proportional);
+    }
+};
+
+
+struct GLTextLabel: GLWidget {
+    float x0, y0;
+    std::string text;
+    bool rerender;
+    GLTextLabel(float x0, float y0, const char *text): x0(x0), y0(y0), text(text), rerender(true) {}
+    void render(float x, float y, bool) override {
+        if (!rerender) {
+            return;
+        }
+        float col[] = {1.0, 1.0, 1.0};
+        XPLMDrawString(col, x0 + x, y0 + y, text.c_str(), nullptr, xplmFont_Proportional);
+        //rerender = false;
+    }
+};
+
+int teleport_window_on_mouse_click(XPLMWindowID id, int x, int y, XPLMMouseStatus status, void *) {
+    int l, t, r, b;
+    XPLMGetWindowGeometry(id, &l, &t, &r, &b);
+
+    if (status == xplm_MouseDown) {
+        if (teleport_window_widgets_focused >= 0) {
+            teleport_window_widgets[teleport_window_widgets_focused]->mark_rerender();
+        }
+        teleport_window_widgets_focused = -1;
+    }
+    for (size_t i = 0; i < teleport_window_widgets.size(); i++) {
+        const auto &w = teleport_window_widgets[i];
+        if (w->is_inside(x - l, y - t)) {
+            if (status == xplm_MouseDown) {
+                teleport_window_widgets_focused = i;
+                w->on_focus();
+            }
+            w->on_mouse(status);
+            w->mark_rerender();
+            XPLMTakeKeyboardFocus(id);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void teleport_window_on_keyboard(XPLMWindowID id, char key, XPLMKeyFlags flag, char inVirtualKey, void *, int losing_focus) {
+    if (id != teleport_window || losing_focus) {
+        return;
+    }
+    if (teleport_window_widgets_focused < 0) {
+        return;
+    }
+    const auto &w = teleport_window_widgets[teleport_window_widgets_focused];
+    w->on_keypress(key, flag);
+}
+
+void teleport_window_on_draw(XPLMWindowID id, void* refcon) {
+    XPLMSetGraphicsState(0, 0, 0, 0, 1, 1, 0);
+    int l, t, r, b;
+    XPLMGetWindowGeometry(id, &l, &t, &r, &b);
+    for (size_t i = 0; i < teleport_window_widgets.size(); i++) {
+        teleport_window_widgets[i]->render(l, t, ssize_t(i) == teleport_window_widgets_focused);
+    }
+}
+
+void menu_handler(void *inMenuRef, void *inItemRef) {
+    auto id = uintptr_t(inItemRef);
+    switch (id) {
+        case 0: {
+            XPLMCommandRef cmd_ref = XPLMFindCommand("lfd/toggle_imc_foggles");
+            XPLMCommandOnce(cmd_ref);
+        }
+        break;
+        case 1: {
+            if (!teleport_window) {
+                teleport_window_widgets.push_back(std::make_unique<GLTextLabel>(10, -15, "Enter the fix:"));
+                teleport_window_widgets.push_back(std::make_unique<GLTextInput>(100, -20, 100, 15));
+                teleport_window_widgets.push_back(std::make_unique<GLTextLabel>(10, -35, "Altitude (ft.):"));
+                teleport_window_widgets.push_back(std::make_unique<GLAltInput>(100, -40, 100, 15));
+                teleport_window_widgets.push_back(std::make_unique<GLButton>(10, -100, "Go!", 50));
+
+                int x0 = 500;
+                int y0 = 500;
+                int w = 400;
+                int h = 150;
+                XPLMCreateWindow_t win;
+	            win.structSize = sizeof(win);
+	            win.left = x0;
+	            win.bottom = y0 - h;
+	            win.right = x0 + w;
+	            win.top = y0;
+	            win.visible = 1;
+	            win.drawWindowFunc = teleport_window_on_draw;
+	            win.handleMouseClickFunc = teleport_window_on_mouse_click;
+	            win.handleRightClickFunc = NULL;
+	            win.handleMouseWheelFunc = NULL;
+	            win.handleKeyFunc = teleport_window_on_keyboard;
+	            win.handleCursorFunc = NULL;
+	            win.refcon = NULL;
+	            win.layer = xplm_WindowLayerFloatingWindows;
+                teleport_window = XPLMCreateWindowEx(&win);
+                XPLMSetWindowPositioningMode(teleport_window, xplm_WindowPositionFree, -1);
+                XPLMSetWindowResizingLimits(teleport_window, w, h, w, h);
+                XPLMSetWindowTitle(teleport_window, "Teleport To");
+            } else {
+                XPLMSetWindowIsVisible(teleport_window, 1);
+            }
+        }
+        break;
+        case 2: XPLMReloadPlugins();
+        break;
+    }
+}
+
+XPLMMenuID menu_id;
+
+PLUGIN_API int XPluginStart(char *outName,char *outSig, char *outDesc) {
     strcpy(outName, "Loupe Flightdeck");
     strcpy(outSig, "com.determinant.loupeflightdeck");
     strcpy(outDesc, "A plugin that reimplements X-Plane's basic UDP API and GDL90 support.");
 
     /* Create a menu for ourselves.  */
-    mySubMenuItem = XPLMAppendMenuItem(
+    auto item = XPLMAppendMenuItem(
             XPLMFindPluginsMenu(),	/* Put in plugins menu */
             "Loupe Flightdeck",		/* Item Title */
             0,						/* Item Ref */
             1);						/* Force English */
 
-    myMenu = XPLMCreateMenu(
+    menu_id = XPLMCreateMenu(
             "Loupe Flightdeck",
             XPLMFindPluginsMenu(),
-            mySubMenuItem, 			/* Menu Item to attach to. */
-            menu_handler,	/* The handler */
-            0);						/* Handler Ref */
+            item,
+            menu_handler,
+            0);
 
-    /* For each command, we set the item refcon to be the key command ID we wnat
-     * to run.   Our callback will use this item refcon to do the right command.
-     * This allows us to write only one callback for the menu. */
-    XPLMAppendMenuItem(myMenu, "Toggle Foggles", NULL, 1);
+    XPLMAppendMenuItem(menu_id, "Toggle Foggles", (void *)0, 1);
+    XPLMAppendMenuItem(menu_id, "Teleport to Fix", (void *)1, 1);
+    XPLMAppendMenuItem(menu_id, "Reload Plugins", (void *)2, 1);
     return 1;
 }
 
-PLUGIN_API void	XPluginStop() {}
+PLUGIN_API void	XPluginStop() {
+    XPLMDestroyMenu(menu_id);
+}
 
 PLUGIN_API void XPluginDisable() {
     XPLMUnregisterCommandHandler(ir_training_cmd, toggle_ir_training, false, NULL);
     XPLMDestroyFlightLoop(ctrl_loop_id);
     XPLMDestroyFlightLoop(data_loop_id);
     XPLMDestroyFlightLoop(gdl90_loop_id);
+
+    if (!teleport_window) {
+        XPLMDestroyWindow(teleport_window);
+    }
+
     if (xps) {
         delete xps;
         xps = NULL;
@@ -781,7 +1094,8 @@ PLUGIN_API void XPluginDisable() {
 
 PLUGIN_API int XPluginEnable() {
     GDL90::crc_init();
-    xps= new XPlaneS();
+
+    xps = new XPlaneS();
     gdl90 = new GDL90();
 
     XPLMCreateFlightLoop_t loop_cfg;
@@ -801,7 +1115,7 @@ PLUGIN_API int XPluginEnable() {
     XPLMScheduleFlightLoop(gdl90_loop_id, -1, 1);
 
     ir_training_cmd = XPLMCreateCommand(
-            "sim/operation/toggle_imc_foggles",
+            "lfd/toggle_imc_foggles",
             "Toggle IR training mode. This will toggle the outside vision (IMC and back to the original condition) and also toggle the G1000 PFD/MFD display.");
     XPLMRegisterCommandHandler(ir_training_cmd, toggle_ir_training, false, NULL);
     return 1;
