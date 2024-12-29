@@ -42,8 +42,17 @@
 #include "XPLMNavigation.h"
 
 const float EPS = 1e-4;
+const double FEET_PER_M = 3.28084;
 
 typedef uint8_t *bytes_t;
+
+double meter_to_feet(double m) {
+    return m * FEET_PER_M;
+}
+
+double feet_to_meter(double ft) {
+    return ft / FEET_PER_M;
+}
 
 void print_debug(const char *fmt, ...) {
     std::string prefixed = std::string("[Loupe Flightdeck] ") + fmt + "\n";
@@ -581,7 +590,7 @@ struct GDL90: public UDPServer {
         float lat = XPLMGetDatad(lat_dataref);
         float lng = XPLMGetDatad(lng_dataref);
         float baro_alt = XPLMGetDataf(baro_alt_dataref); // FIXME: use 29.92 as the reference
-        float geo_alt = XPLMGetDatad(geo_alt_dataref) * 3.28084;
+        float geo_alt = meter_to_feet(XPLMGetDatad(geo_alt_dataref));
         float gs = XPLMGetDataf(gs_dataref) * 1.94384;
         float vs = XPLMGetDataf(vs_dataref);
         float trk = XPLMGetDataf(trk_dataref);
@@ -826,13 +835,18 @@ struct GLTextInput: GLWidget {
         glColor3fv(col);
         glRectf(x + l, y + t, x + r, y + b);
         float white[] = {0, 0, 0};
-        XPLMDrawString(white, x + l, y + t - 10, text.c_str(), nullptr, xplmFont_Proportional);
+        XPLMDrawString(white, x + l + 5, y + t - 10, text.c_str(), nullptr, xplmFont_Proportional);
     }
 };
 
 double get_elevation() {
     auto alt_ref = XPLMFindDataRef("sim/flightmodel/position/elevation");
     return XPLMGetDatad(alt_ref);
+}
+
+float get_ias() {
+    auto dataref = XPLMFindDataRef("sim/flightmodel/position/indicated_airspeed");
+    return XPLMGetDataf(dataref);
 }
 
 std::string to_string_with_precision(const double v, const int n = 4) {
@@ -851,8 +865,21 @@ struct GLAltInput: public GLTextInput {
 
     void on_focus() override {
         if (text.length() == 0) {
-            text = to_string_with_precision(get_elevation() * 3.28084);
-            print_debug("here: %s", text.c_str());
+            text = to_string_with_precision(meter_to_feet(get_elevation()));
+        }
+    }
+};
+
+struct GLIASInput: public GLTextInput {
+    using GLTextInput::GLTextInput;
+
+    bool verify_input(std::string &edited) override {
+        return std::regex_match(edited, std::regex("[0-9.]*"));
+    }
+
+    void on_focus() override {
+        if (text.length() == 0) {
+            text = to_string_with_precision(std::max(0, get_ias()), 0);
         }
     }
 };
@@ -883,15 +910,28 @@ struct GLButton: GLWidget {
                     print_debug("teleporting to %s(type=%d, lat=%.6f, lng=%.6f, elev=%.2f)", name, type, lat, lng, elev);
                     double x, y, z;
                     const std::string &alt_str = dynamic_cast<GLAltInput*>(teleport_window_widgets[3].get())->text;
+                    const std::string &ias_str = dynamic_cast<GLIASInput*>(teleport_window_widgets[5].get())->text;
 
                     auto sim_speed_ref = XPLMFindDataRef("sim/time/sim_speed");
                     XPLMSetDatai(sim_speed_ref, 0);
 
                     size_t n;
+
                     auto alt = std::stod(alt_str, &n);
-                    if (n != alt_str.length()) {
+                    if (n == alt_str.length()) {
+                        alt = feet_to_meter(alt);
+                    } else {
                         alt = get_elevation();
                     }
+
+                    auto ias = std::stof(ias_str, &n);
+                    if (n != ias_str.length()) {
+                        ias = get_ias();
+                    }
+                    if (ias < 80) {
+                        ias = 80;
+                    }
+
                     XPLMWorldToLocal(lat, lng, alt, &x, &y, &z);
                     auto local_x = XPLMFindDataRef("sim/flightmodel/position/local_x");
                     auto local_y = XPLMFindDataRef("sim/flightmodel/position/local_y");
@@ -899,6 +939,8 @@ struct GLButton: GLWidget {
                     XPLMSetDatad(local_x, x);
                     XPLMSetDatad(local_y, y);
                     XPLMSetDatad(local_z, z);
+                    auto ias_dataref = XPLMFindDataRef("sim/flightmodel/position/indicated_airspeed");
+                    XPLMSetDataf(ias_dataref, ias);
                 } else {
                     print_debug("invalid navaid/fix ID: %s", target_id);
                 }
@@ -1000,6 +1042,8 @@ void menu_handler(void *inMenuRef, void *inItemRef) {
                 teleport_window_widgets.push_back(std::make_unique<GLTextInput>(100, -20, 100, 15));
                 teleport_window_widgets.push_back(std::make_unique<GLTextLabel>(10, -35, "Altitude (ft.):"));
                 teleport_window_widgets.push_back(std::make_unique<GLAltInput>(100, -40, 100, 15));
+                teleport_window_widgets.push_back(std::make_unique<GLTextLabel>(10, -55, "IAS (kts.):"));
+                teleport_window_widgets.push_back(std::make_unique<GLIASInput>(100, -60, 100, 15));
                 teleport_window_widgets.push_back(std::make_unique<GLButton>(10, -100, "Go!", 50));
 
                 int x0 = 500;
