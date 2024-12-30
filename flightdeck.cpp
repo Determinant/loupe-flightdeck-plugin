@@ -42,6 +42,8 @@
 #include "XPLMDisplay.h"
 #include "XPLMNavigation.h"
 
+using std::string;
+
 const float EPS = 1e-4;
 const float PI = 3.14159265358979323846;
 const double FEET_PER_M = 3.28084;
@@ -64,8 +66,15 @@ double mps_to_kts(double v) {
     return v / 0.514444;
 }
 
+string to_string_with_precision(const double v, const int n = 4) {
+    std::ostringstream out;
+    out.precision(n);
+    out << std::fixed << v;
+    return std::move(out).str();
+}
+
 void print_debug(const char *fmt, ...) {
-    std::string prefixed = std::string("[Loupe Flightdeck] ") + fmt + "\n";
+    string prefixed = string("[Loupe Flightdeck] ") + fmt + "\n";
     const char *fmt_ = prefixed.c_str();
     va_list ap;
     va_start(ap, fmt);
@@ -124,7 +133,7 @@ struct Subscription {
                                 dataref(dataref), datatype(datatype), idx(idx), from(from) {}
 
     void print() {
-        std::string output = "<sub ";
+        string output = "<sub ";
         output += "id=" + std::to_string(id) + \
                 ",freq=" + std::to_string(freq) + \
                 ",dataref=" + std::to_string((uintptr_t)dataref) + \
@@ -144,7 +153,7 @@ struct Event {
 };
 
 struct CommandEvent: public Event {
-    std::string cmd;
+    string cmd;
     
     CommandEvent(const char *cmd): cmd(cmd) {}
     ~CommandEvent() override {}
@@ -160,7 +169,7 @@ struct CommandEvent: public Event {
 };
 
 struct DataSubscribeEvent: public Event {
-    std::string dataref;
+    string dataref;
     int32_t freq;
     int32_t id;
     SocketAddr from;
@@ -173,7 +182,7 @@ struct DataSubscribeEvent: public Event {
         std::optional<uint8_t> idx;
         if (dataref.length() > 0 && dataref.back() == ']') {
             auto array_pos = dataref.find('[');
-            if (array_pos != std::string::npos) {
+            if (array_pos != string::npos) {
                 auto prefix = dataref.substr(0, array_pos);
                 size_t n;
                 auto idx_str = dataref.substr(array_pos + 1, dataref.length() - 2 - array_pos);
@@ -198,22 +207,97 @@ struct DataSubscribeEvent: public Event {
     }
 };
 
-/*
-struct TeleportEvent: public Event {
-    XPLMNavRef nav;
+std::unordered_map<string, XPLMNavRef> navaid_table;
 
-    TeleportEvent(XPLMNavRef nav): nav(nav) {};
+void navaid_table_init() {
+    static bool navaid_table_initialized = false;
+    if (navaid_table_initialized) return;
+    navaid_table_initialized = true;
+    auto nav = XPLMGetFirstNavAid();
+    char id[32];
+    float lat, lng;
+    while (nav != XPLM_NAV_NOT_FOUND) {
+        XPLMGetNavAidInfo(nav, nullptr, &lat, &lng, nullptr, nullptr, nullptr, id, nullptr, nullptr);
+        string id_str(id);
+        if (navaid_table.count(id_str) == 0 ||
+            (-162 < lng && lng < -68)) { // keep the US area for ambiguous navaids
+            navaid_table[id_str] = nav;
+        }
+        nav = XPLMGetNextNavAid(nav);
+    }
+}
+
+double get_elevation() {
+    auto dref = XPLMFindDataRef("sim/flightmodel/position/elevation");
+    return XPLMGetDatad(dref);
+}
+
+float get_groundspeed() {
+    auto dref = XPLMFindDataRef("sim/flightmodel/position/groundspeed");
+    return XPLMGetDataf(dref);
+}
+
+struct TeleportEvent: public Event {
+    string id;
+    string alt;
+    string gs;
+
+    TeleportEvent(string id, string alt, string gs): id(id), alt(alt), gs(gs) {};
     ~TeleportEvent() override {}
 
     void handle() override {
         XPLMNavType type;
         float lat, lng, elev;
-        char name[128];
-        XPLMGetNavAidInfo(nav, &type, &lat, &lng, &elev, NULL, NULL, NULL, name, NULL);
-        print_debug("teleporting to %s(type=%d, lat=%.6f, lng=%.6f, elev=%.2f)", name, type, lat, lng, elev);
+        char name[256];
+        navaid_table_init();
+        auto it = navaid_table.find(id);
+        if (it != navaid_table.end()) {
+            XPLMGetNavAidInfo(it->second, &type, &lat, &lng, &elev, nullptr, nullptr, nullptr, name, nullptr);
+            print_debug("teleporting to %s(type=%d, lat=%.6f, lng=%.6f, elev=%.2f)", name, type, lat, lng, elev);
+            auto sim_speed_dref = XPLMFindDataRef("sim/time/sim_speed");
+            XPLMSetDatai(sim_speed_dref, 0);
+
+            size_t n;
+
+            auto alt = std::stod(this->alt, &n);
+            if (n == this->alt.length()) {
+                alt = feet_to_meter(alt);
+            } else {
+                alt = get_elevation();
+            }
+
+            auto gs = std::stof(this->gs, &n);
+            if (n != this->gs.length()) {
+                gs = mps_to_kts(get_groundspeed());
+            }
+            if (gs < 80) {
+                gs = 80;
+            }
+
+            double x, y, z;
+            XPLMWorldToLocal(lat, lng, alt, &x, &y, &z);
+            auto local_x_dref = XPLMFindDataRef("sim/flightmodel/position/local_x");
+            auto local_y_dref = XPLMFindDataRef("sim/flightmodel/position/local_y");
+            auto local_z_dref = XPLMFindDataRef("sim/flightmodel/position/local_z");
+            auto local_vx_dref = XPLMFindDataRef("sim/flightmodel/position/local_vx");
+            auto local_vy_dref = XPLMFindDataRef("sim/flightmodel/position/local_vy");
+            auto local_vz_dref = XPLMFindDataRef("sim/flightmodel/position/local_vz");
+            auto psi_dref = XPLMFindDataRef("sim/flightmodel/position/psi");
+            auto psi = XPLMGetDataf(psi_dref) * PI / 180;
+            auto mps = kts_to_mps(gs);
+
+            XPLMSetDatad(local_x_dref, x);
+            XPLMSetDatad(local_y_dref, y);
+            XPLMSetDatad(local_z_dref, z);
+
+            XPLMSetDataf(local_vx_dref, mps * sin(psi));
+            XPLMSetDataf(local_vz_dref, mps * -cos(psi));
+            XPLMSetDataf(local_vy_dref, 0);
+        } else {
+            print_debug("invalid navaid/fix ID: %s", id.c_str());
+        }
     }
 };
-*/
 
 struct EventQueue {
     std::mutex lck;
@@ -251,7 +335,7 @@ struct UDPServer {
     
     static const size_t MAX_OUTBOUND_QUEUED = 1024;
 
-    virtual void handle_message(bytes_t buffer, size_t len, SocketAddr from) = 0;
+    virtual void on_message(bytes_t buffer, size_t len, SocketAddr from) = 0;
 
     UDPServer(int port): outbound_msgs(), outbound_cv(), outbound_lock(),
                 outbound_readable(false), outbound_exit(false) {
@@ -285,7 +369,7 @@ struct UDPServer {
             for (;;) {
                 int n = recvfrom(sockfd, buffer, BUFFER_SIZE, 0, (struct sockaddr *)&client_addr, &addr_len);
                 if (n > 0) {
-                    handle_message(buffer, n, client_addr);
+                    on_message(buffer, n, client_addr);
                 } else {
                     break;
                 }
@@ -353,7 +437,7 @@ struct XPlaneS: public UDPServer {
 
     XPlaneS(): UDPServer(PORT) {}
 
-    void handle_message(bytes_t buffer, size_t len, SocketAddr from) override {
+    void on_message(bytes_t buffer, size_t len, SocketAddr from) override {
         //print_debug("got a message %lu", len);
         size_t prefix = 0;
         for (bytes_t ptr = buffer; ptr < buffer + len; ptr++) {
@@ -392,34 +476,33 @@ struct GDL90: public UDPServer {
     std::optional<struct sockaddr_in> foreflight_addr;
     std::mutex foreflight_addr_lock;
 
-    XPLMDataRef lat_dataref, lng_dataref,
-                baro_alt_dataref, geo_alt_dataref,
-                gs_dataref, vs_dataref, trk_dataref,
-                roll_dataref, pitch_dataref, hdg_dataref,
-                tas_dataref, ias_dataref;
+    XPLMDataRef lat_dref, lng_dref,
+                baro_alt_dref, geo_alt_dref,
+                gs_dref, vs_dref, trk_dref,
+                roll_dref, pitch_dref, hdg_dref,
+                tas_dref, ias_dref;
 
     static const int PORT = 63093;
 
     GDL90(): UDPServer(PORT) {
-        lat_dataref = XPLMFindDataRef("sim/flightmodel/position/latitude");
-        lng_dataref = XPLMFindDataRef("sim/flightmodel/position/longitude");
-        baro_alt_dataref = XPLMFindDataRef("sim/flightmodel/misc/h_ind");
-        geo_alt_dataref = XPLMFindDataRef("sim/flightmodel/position/elevation");
-        gs_dataref = XPLMFindDataRef("sim/flightmodel/position/groundspeed");
-        vs_dataref = XPLMFindDataRef("sim/flightmodel/position/vh_ind_fpm");
-        trk_dataref = XPLMFindDataRef("sim/flightmodel/position/hpath");
-
-        roll_dataref = XPLMFindDataRef("sim/flightmodel/position/phi");
-        pitch_dataref = XPLMFindDataRef("sim/flightmodel/position/theta");
-        hdg_dataref = XPLMFindDataRef("sim/flightmodel/position/mag_psi");
-        ias_dataref = XPLMFindDataRef("sim/flightmodel/position/indicated_airspeed");
-        tas_dataref = XPLMFindDataRef("sim/flightmodel/position/true_airspeed");
+        lat_dref = XPLMFindDataRef("sim/flightmodel/position/latitude");
+        lng_dref = XPLMFindDataRef("sim/flightmodel/position/longitude");
+        baro_alt_dref = XPLMFindDataRef("sim/flightmodel/misc/h_ind");
+        geo_alt_dref = XPLMFindDataRef("sim/flightmodel/position/elevation");
+        gs_dref = XPLMFindDataRef("sim/flightmodel/position/groundspeed");
+        vs_dref = XPLMFindDataRef("sim/flightmodel/position/vh_ind_fpm");
+        trk_dref = XPLMFindDataRef("sim/flightmodel/position/hpath");
+        roll_dref = XPLMFindDataRef("sim/flightmodel/position/phi");
+        pitch_dref = XPLMFindDataRef("sim/flightmodel/position/theta");
+        hdg_dref = XPLMFindDataRef("sim/flightmodel/position/mag_psi");
+        ias_dref = XPLMFindDataRef("sim/flightmodel/position/indicated_airspeed");
+        tas_dref = XPLMFindDataRef("sim/flightmodel/position/true_airspeed");
     }
 
-    void handle_message(bytes_t buffer, size_t len, SocketAddr from) override {
+    void on_message(bytes_t buffer, size_t len, SocketAddr from) override {
         auto f = from.get_sockaddr_in();
-        std::string s = (const char *)buffer;
-        if (s.find("ForeFlight") != std::string::npos && s.find("GDL90") != std::string::npos) {
+        string s = (const char *)buffer;
+        if (s.find("ForeFlight") != string::npos && s.find("GDL90") != string::npos) {
             auto pos = s.find("\"port\":");
             auto port = std::stoi(s.substr(pos + 7));
             f.sin_port = htons(port);
@@ -441,8 +524,8 @@ struct GDL90: public UDPServer {
 
     /// pasted from Garmin's GDL90 spec
     static uint16_t crc16_table[];
-    static bool crc_initialized;
     static void crc_init() {
+        static bool crc_initialized = false;
         if (crc_initialized) return;
         crc_initialized = true;
         uint16_t crc;
@@ -492,14 +575,14 @@ struct GDL90: public UDPServer {
     }
 
     void send_idmsg(
-            std::string name = "Loupe Flightdeck",
+            string name = "Loupe Flightdeck",
             uint64_t serial = 0x12345678, bool alt_msl = true) {
         uint8_t buffer[39];
         buffer[0] = 0x65;
         buffer[1] = 0;
         buffer[2] = 1;
         *((uint64_t *)(buffer + 3)) = htobe64(serial);
-        name += std::string(16, ' ');
+        name += string(16, ' ');
         memmove((char *)(buffer + 11), name.c_str(), 8);
         memmove((char *)(buffer + 19), name.c_str(), 16);
         *((uint32_t *)(buffer + 35)) = htobe32(alt_msl ? 1 : 0);
@@ -510,7 +593,7 @@ struct GDL90: public UDPServer {
             bytes_t buffer,
             float lat, float lng, float baro_alt,
             std::optional<float> gs, float vs, float trk,
-            uint8_t misc = 0x9, uint32_t addr = 0x000000, std::string callsign = "N123AB",
+            uint8_t misc = 0x9, uint32_t addr = 0x000000, string callsign = "N123AB",
             uint8_t nic_acc = 0xbb, uint8_t emitter = 0x1, uint8_t emergency = 0) {
         buffer[0] = 0x00; // no alert, ADS-B with self-assigned address
 
@@ -543,7 +626,7 @@ struct GDL90: public UDPServer {
         buffer[15] = vvv & 0xff;
         buffer[16] = uint32_t(trk / 360 * 256) & 0xff;
         buffer[17] = emitter;
-        callsign += std::string(8, ' ');
+        callsign += string(8, ' ');
         memmove((char *)(buffer + 18), callsign.c_str(), 8); // tail number
         buffer[26] = (emergency & 0xf) << 4; // no emergency
     }
@@ -551,7 +634,7 @@ struct GDL90: public UDPServer {
     void send_ownship_report(
             float lat, float lng, float baro_alt,
             std::optional<float> gs, float vs, float trk,
-            uint8_t misc = 0x9, uint32_t addr = 0x000000, std::string callsign = "N123AB",
+            uint8_t misc = 0x9, uint32_t addr = 0x000000, string callsign = "N123AB",
             uint8_t nic_acc = 0xbb, uint8_t emitter = 0x1, uint8_t emergency = 0) {
         uint8_t buffer[28];
         buffer[0] = 10;
@@ -597,13 +680,13 @@ struct GDL90: public UDPServer {
     }
 
     void update_1hz() {
-        float lat = XPLMGetDatad(lat_dataref);
-        float lng = XPLMGetDatad(lng_dataref);
-        float baro_alt = XPLMGetDataf(baro_alt_dataref); // FIXME: use 29.92 as the reference
-        float geo_alt = meter_to_feet(XPLMGetDatad(geo_alt_dataref));
-        float gs = XPLMGetDataf(gs_dataref) * 1.94384;
-        float vs = XPLMGetDataf(vs_dataref);
-        float trk = XPLMGetDataf(trk_dataref);
+        float lat = XPLMGetDatad(lat_dref);
+        float lng = XPLMGetDatad(lng_dref);
+        float baro_alt = XPLMGetDataf(baro_alt_dref); // FIXME: use 29.92 as the reference
+        float geo_alt = meter_to_feet(XPLMGetDatad(geo_alt_dref));
+        float gs = XPLMGetDataf(gs_dref) * 1.94384;
+        float vs = XPLMGetDataf(vs_dref);
+        float trk = XPLMGetDataf(trk_dref);
         foreflight_addr_lock.lock();
         if (foreflight_addr.has_value()) {
             send_heartbeat(true);
@@ -617,11 +700,11 @@ struct GDL90: public UDPServer {
     }
 
     void update_ahrs() {
-        float roll = XPLMGetDataf(roll_dataref);
-        float pitch = XPLMGetDataf(pitch_dataref);
-        float hdg = XPLMGetDataf(hdg_dataref);
-        float ias = XPLMGetDataf(ias_dataref);
-        float tas = XPLMGetDataf(tas_dataref);
+        float roll = XPLMGetDataf(roll_dref);
+        float pitch = XPLMGetDataf(pitch_dref);
+        float hdg = XPLMGetDataf(hdg_dref);
+        float ias = XPLMGetDataf(ias_dref);
+        float tas = XPLMGetDataf(tas_dref);
         foreflight_addr_lock.lock();
         if (foreflight_addr.has_value()) {
             send_ahrs_message(roll, pitch, hdg, ias, tas);
@@ -631,13 +714,13 @@ struct GDL90: public UDPServer {
 };
 
 uint16_t GDL90::crc16_table[256];
-bool GDL90::crc_initialized = false;
 
-XPlaneS *xps = NULL;
-GDL90 *gdl90 = NULL;
+XPlaneS *xps = nullptr;
+GDL90 *gdl90 = nullptr;
 XPLMFlightLoopID ctrl_loop_id;
 XPLMFlightLoopID data_loop_id;
 XPLMFlightLoopID gdl90_loop_id;
+XPLMCommandRef ir_training_cmd;
 
 float ctrl_loop(float elapsed, float, int, void *) {
     for (;;) {
@@ -660,7 +743,7 @@ float data_loop(float, float, int, void *) {
         expired[id.first].push_back(std::make_pair(id.second, id2sub[id]));
     }
     if (!expired.empty() && xps) {
-        static const auto prefix = std::string("RREF,");
+        static const auto prefix = string("RREF,");
 
         for (const auto &[a, v]: expired) {
             std::vector<uint8_t> data_msg;
@@ -741,10 +824,8 @@ float gdl90_loop(float, float, int, void *) {
     return interval;
 }
 
-float orig_cloud_data[9];
-XPLMCommandRef ir_training_cmd;
-
 int toggle_ir_training(XPLMCommandRef, XPLMCommandPhase phase, void *) {
+    static float orig_cloud_data[9];
     if (phase != xplm_CommandBegin) {
         return 1;
     }
@@ -753,26 +834,26 @@ int toggle_ir_training(XPLMCommandRef, XPLMCommandPhase phase, void *) {
     cmd_ref = XPLMFindCommand("sim/GPS/g1000n3_popup");
     XPLMCommandOnce(cmd_ref);
     static const float cloud_ir[9] = {0.0, 10000.0, 11000.0, 10000.0, 11000.0, 21000.0, 6, 6, 6};
-    static XPLMDataRef cloud_refs[9];
+    static XPLMDataRef cloud_drefs[9];
     for (int i = 0; i < 3; i++) {
         static char buff[64];
         sprintf(buff, "sim/weather/cloud_base_msl_m[%d]", i);
-        cloud_refs[i] = XPLMFindDataRef(buff);
+        cloud_drefs[i] = XPLMFindDataRef(buff);
         sprintf(buff, "sim/weather/cloud_tops_msl_m[%d]", i);
-        cloud_refs[i + 3] = XPLMFindDataRef(buff);
+        cloud_drefs[i + 3] = XPLMFindDataRef(buff);
         sprintf(buff, "sim/weather/cloud_coverage[%d]", i);
-        cloud_refs[i + 6] = XPLMFindDataRef(buff);
+        cloud_drefs[i + 6] = XPLMFindDataRef(buff);
     }
-    if (XPLMGetDataf(cloud_refs[0]) < EPS) {
+    if (XPLMGetDataf(cloud_drefs[0]) < EPS) {
         print_debug("foggles off...");
         for (int i = 0; i < 9; i++) {
-            XPLMSetDataf(cloud_refs[i], orig_cloud_data[i]);
+            XPLMSetDataf(cloud_drefs[i], orig_cloud_data[i]);
         }
     } else {
         print_debug("foggles on...");
         for (int i = 0; i < 9; i++) {
-            orig_cloud_data[i] = XPLMGetDataf(cloud_refs[i]);
-            XPLMSetDataf(cloud_refs[i], cloud_ir[i]);
+            orig_cloud_data[i] = XPLMGetDataf(cloud_drefs[i]);
+            XPLMSetDataf(cloud_drefs[i], cloud_ir[i]);
         }
     }
     return 0;
@@ -781,7 +862,6 @@ int toggle_ir_training(XPLMCommandRef, XPLMCommandPhase phase, void *) {
 struct GLWidget {
     virtual bool is_inside(float x, float y) { return false; }
     virtual void render(float x, float y, bool focused) = 0;
-    virtual void mark_rerender() {}
     virtual void on_keypress(char key, XPLMKeyFlags flag) {}
     virtual void on_mouse(XPLMMouseStatus status) {}
     virtual void on_focus() {}
@@ -790,39 +870,18 @@ struct GLWidget {
 XPLMWindowID teleport_window = 0;
 std::vector<std::unique_ptr<GLWidget>> teleport_window_widgets;
 ssize_t teleport_window_widgets_focused = -1;
-std::unordered_map<std::string, XPLMNavRef> navaid_table;
-bool navaid_table_initialized = false;
-
-void navaid_table_init() {
-    if (navaid_table_initialized) return;
-    navaid_table_initialized = true;
-    auto nav = XPLMGetFirstNavAid();
-    char id[32];
-    float lat, lng;
-    while (nav != XPLM_NAV_NOT_FOUND) {
-        XPLMGetNavAidInfo(nav, NULL, &lat, &lng, NULL, NULL, NULL, id, NULL, NULL);
-        std::string id_str(id);
-        if (navaid_table.count(id_str) == 0 ||
-            (-162 < lng && lng < -68)) { // keep the US area for ambiguous navaids
-            navaid_table[id_str] = nav;
-        }
-        nav = XPLMGetNextNavAid(nav);
-    }
-}
 
 struct GLTextInput: GLWidget {
     float l, r, t, b;
-    std::string text;
-    bool rerender;
+    string text;
 
-    GLTextInput(float x0, float y0, float w, float h): l(x0), r(x0 + w), t(y0 + h), b(y0), text(""), rerender(true) {}
-    void mark_rerender() override { rerender = true; }
+    GLTextInput(float l, float b, float w, float h): \
+        l(l), r(l + w), t(b + h), b(b), text("") {}
     bool is_inside(float x, float y) override {
         return l < x && x < r && b < y && y < t; 
     }
-    virtual bool verify_input(std::string &edited) {
-        std::transform(edited.begin(), edited.end(), edited.begin(), ::toupper);
-        return std::regex_match(edited, std::regex("[A-Z0-9.]*"));
+    virtual bool verify_input(string &edited) {
+        return true;
     }
     void on_keypress(char key, XPLMKeyFlags flag) override {
         if (!(flag & xplm_DownFlag)) {
@@ -839,9 +898,6 @@ struct GLTextInput: GLWidget {
     }
     void render(float x, float y, bool focused) override {
         float col[3] = {1, 1, 1};
-        if (!rerender) {
-            return;
-        }
         if (!focused) {
             col[0] = 0.5;
             col[1] = 0.5;
@@ -854,27 +910,19 @@ struct GLTextInput: GLWidget {
     }
 };
 
-double get_elevation() {
-    auto alt_ref = XPLMFindDataRef("sim/flightmodel/position/elevation");
-    return XPLMGetDatad(alt_ref);
-}
+struct GLFixInput: public GLTextInput {
+    using GLTextInput::GLTextInput;
 
-float get_gs() {
-    auto dataref = XPLMFindDataRef("sim/flightmodel/position/groundspeed");
-    return mps_to_kts(XPLMGetDataf(dataref));
-}
-
-std::string to_string_with_precision(const double v, const int n = 4) {
-    std::ostringstream out;
-    out.precision(n);
-    out << std::fixed << v;
-    return std::move(out).str();
-}
+    bool verify_input(string &edited) override {
+        std::transform(edited.begin(), edited.end(), edited.begin(), ::toupper);
+        return std::regex_match(edited, std::regex("[A-Z0-9.]*"));
+    }
+};
 
 struct GLAltInput: public GLTextInput {
     using GLTextInput::GLTextInput;
 
-    bool verify_input(std::string &edited) override {
+    bool verify_input(string &edited) override {
         return std::regex_match(edited, std::regex("[-0-9.]*"));
     }
 
@@ -888,25 +936,23 @@ struct GLAltInput: public GLTextInput {
 struct GLGSInput: public GLTextInput {
     using GLTextInput::GLTextInput;
 
-    bool verify_input(std::string &edited) override {
+    bool verify_input(string &edited) override {
         return std::regex_match(edited, std::regex("[0-9.]*"));
     }
 
     void on_focus() override {
         if (text.length() == 0) {
-            text = to_string_with_precision(std::max(0.0f, get_gs()), 0);
+            text = to_string_with_precision(std::max(0.0f, get_groundspeed()), 0);
         }
     }
 };
 
 struct GLButton: GLWidget {
     float l, r, t, b;
-    std::string text;
+    string text;
     bool down;
-    bool rerender;
 
-    GLButton(float x0, float y0, const char *text, float w): l(x0), r(x0 + w), t(y0 + 15), b(y0), text(text), down(false), rerender(true) {}
-    void mark_rerender() override { rerender = true; }
+    GLButton(float x0, float y0, const char *text, float w): l(x0), r(x0 + w), t(y0 + 15), b(y0), text(text), down(false) {}
     bool is_inside(float x, float y) override {
         return l < x && x < r && b < y && y < t; 
     }
@@ -914,58 +960,10 @@ struct GLButton: GLWidget {
         switch (status) {
             case xplm_MouseDown: {
                 down = true;
-                auto target_id = dynamic_cast<GLTextInput*>(teleport_window_widgets[1].get())->text.c_str();
-                XPLMNavType type;
-                float lat, lng, elev;
-                char name[256];
-                navaid_table_init();
-                auto it = navaid_table.find(target_id);
-                if (it != navaid_table.end()) {
-                    XPLMGetNavAidInfo(it->second, &type, &lat, &lng, &elev, NULL, NULL, NULL, name, NULL);
-                    print_debug("teleporting to %s(type=%d, lat=%.6f, lng=%.6f, elev=%.2f)", name, type, lat, lng, elev);
-                    double x, y, z;
-                    const std::string &alt_str = dynamic_cast<GLAltInput*>(teleport_window_widgets[3].get())->text;
-                    const std::string &ias_str = dynamic_cast<GLGSInput*>(teleport_window_widgets[5].get())->text;
-
-                    auto sim_speed_ref = XPLMFindDataRef("sim/time/sim_speed");
-                    XPLMSetDatai(sim_speed_ref, 0);
-
-                    size_t n;
-
-                    auto alt = std::stod(alt_str, &n);
-                    if (n == alt_str.length()) {
-                        alt = feet_to_meter(alt);
-                    } else {
-                        alt = get_elevation();
-                    }
-
-                    auto gs = std::stof(ias_str, &n);
-                    if (n != ias_str.length()) {
-                        gs = get_gs();
-                    }
-                    if (gs < 80) {
-                        gs = 80;
-                    }
-
-                    XPLMWorldToLocal(lat, lng, alt, &x, &y, &z);
-                    auto local_x = XPLMFindDataRef("sim/flightmodel/position/local_x");
-                    auto local_y = XPLMFindDataRef("sim/flightmodel/position/local_y");
-                    auto local_z = XPLMFindDataRef("sim/flightmodel/position/local_z");
-                    XPLMSetDatad(local_x, x);
-                    XPLMSetDatad(local_y, y);
-                    XPLMSetDatad(local_z, z);
-                    auto local_vx = XPLMFindDataRef("sim/flightmodel/position/local_vx");
-                    auto local_vy = XPLMFindDataRef("sim/flightmodel/position/local_vy");
-                    auto local_vz = XPLMFindDataRef("sim/flightmodel/position/local_vz");
-                    auto psi_ref = XPLMFindDataRef("sim/flightmodel/position/psi");
-                    auto psi = XPLMGetDataf(psi_ref) * PI / 180;
-                    auto mps = kts_to_mps(gs);
-                    XPLMSetDataf(local_vx, mps * sin(psi));
-                    XPLMSetDataf(local_vz, mps * -cos(psi));
-                    XPLMSetDataf(local_vy, 0);
-                } else {
-                    print_debug("invalid navaid/fix ID: %s", target_id);
-                }
+                string id = dynamic_cast<GLFixInput*>(teleport_window_widgets[1].get())->text;
+                string alt = dynamic_cast<GLAltInput*>(teleport_window_widgets[3].get())->text;
+                string gs = dynamic_cast<GLGSInput*>(teleport_window_widgets[5].get())->text;
+                xps->events.push(std::unique_ptr<Event>(new TeleportEvent(id, alt, gs)));
             }
             break;
             case xplm_MouseUp: down = false; break;
@@ -975,9 +973,6 @@ struct GLButton: GLWidget {
     void render(float x, float y, bool) override {
         float col[3] = {0.4218, 0.5391, 0.9297};
         float white[] = {0, 0, 0};
-        if (!rerender) {
-            return;
-        }
         if (down) {
             for (auto &c: col) c = 1 - c;
             for (auto &w: white) w = 1 - w;
@@ -991,16 +986,11 @@ struct GLButton: GLWidget {
 
 struct GLTextLabel: GLWidget {
     float x0, y0;
-    std::string text;
-    bool rerender;
-    GLTextLabel(float x0, float y0, const char *text): x0(x0), y0(y0), text(text), rerender(true) {}
+    string text;
+    GLTextLabel(float x0, float y0, const char *text): x0(x0), y0(y0), text(text) {}
     void render(float x, float y, bool) override {
-        if (!rerender) {
-            return;
-        }
         float col[] = {1.0, 1.0, 1.0};
         XPLMDrawString(col, x0 + x, y0 + y, text.c_str(), nullptr, xplmFont_Proportional);
-        //rerender = false;
     }
 };
 
@@ -1009,9 +999,6 @@ int teleport_window_on_mouse_click(XPLMWindowID id, int x, int y, XPLMMouseStatu
     XPLMGetWindowGeometry(id, &l, &t, &r, &b);
 
     if (status == xplm_MouseDown) {
-        if (teleport_window_widgets_focused >= 0) {
-            teleport_window_widgets[teleport_window_widgets_focused]->mark_rerender();
-        }
         teleport_window_widgets_focused = -1;
     }
     for (size_t i = 0; i < teleport_window_widgets.size(); i++) {
@@ -1022,7 +1009,6 @@ int teleport_window_on_mouse_click(XPLMWindowID id, int x, int y, XPLMMouseStatu
                 w->on_focus();
             }
             w->on_mouse(status);
-            w->mark_rerender();
             XPLMTakeKeyboardFocus(id);
             return 1;
         }
@@ -1061,17 +1047,15 @@ void menu_handler(void *inMenuRef, void *inItemRef) {
         case 1: {
             if (!teleport_window) {
                 teleport_window_widgets.push_back(std::make_unique<GLTextLabel>(10, -15, "Enter the fix:"));
-                teleport_window_widgets.push_back(std::make_unique<GLTextInput>(100, -20, 100, 15));
+                teleport_window_widgets.push_back(std::make_unique<GLFixInput>(100, -20, 100, 15));
                 teleport_window_widgets.push_back(std::make_unique<GLTextLabel>(10, -35, "Altitude (ft.):"));
                 teleport_window_widgets.push_back(std::make_unique<GLAltInput>(100, -40, 100, 15));
                 teleport_window_widgets.push_back(std::make_unique<GLTextLabel>(10, -55, "GS (kts.):"));
                 teleport_window_widgets.push_back(std::make_unique<GLGSInput>(100, -60, 100, 15));
                 teleport_window_widgets.push_back(std::make_unique<GLButton>(10, -100, "Go!", 50));
 
-                int x0 = 500;
-                int y0 = 500;
-                int w = 400;
-                int h = 150;
+                int x0 = 500, y0 = 500;
+                int w = 300, h = 150;
                 XPLMCreateWindow_t win;
 	            win.structSize = sizeof(win);
 	            win.left = x0;
@@ -1081,11 +1065,11 @@ void menu_handler(void *inMenuRef, void *inItemRef) {
 	            win.visible = 1;
 	            win.drawWindowFunc = teleport_window_on_draw;
 	            win.handleMouseClickFunc = teleport_window_on_mouse_click;
-	            win.handleRightClickFunc = NULL;
-	            win.handleMouseWheelFunc = NULL;
+	            win.handleRightClickFunc = nullptr;
+	            win.handleMouseWheelFunc = nullptr;
 	            win.handleKeyFunc = teleport_window_on_keyboard;
-	            win.handleCursorFunc = NULL;
-	            win.refcon = NULL;
+	            win.handleCursorFunc = nullptr;
+	            win.refcon = nullptr;
 	            win.layer = xplm_WindowLayerFloatingWindows;
                 teleport_window = XPLMCreateWindowEx(&win);
                 XPLMSetWindowPositioningMode(teleport_window, xplm_WindowPositionFree, -1);
@@ -1103,17 +1087,12 @@ void menu_handler(void *inMenuRef, void *inItemRef) {
 
 XPLMMenuID menu_id;
 
-PLUGIN_API int XPluginStart(char *outName,char *outSig, char *outDesc) {
+PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc) {
     strcpy(outName, "Loupe Flightdeck");
     strcpy(outSig, "com.determinant.loupeflightdeck");
     strcpy(outDesc, "A plugin that reimplements X-Plane's basic UDP API and GDL90 support.");
 
-    /* Create a menu for ourselves.  */
-    auto item = XPLMAppendMenuItem(
-            XPLMFindPluginsMenu(),	/* Put in plugins menu */
-            "Loupe Flightdeck",		/* Item Title */
-            0,						/* Item Ref */
-            1);						/* Force English */
+    auto item = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "Loupe Flightdeck", 0, 1);
 
     menu_id = XPLMCreateMenu(
             "Loupe Flightdeck",
@@ -1132,32 +1111,6 @@ PLUGIN_API void	XPluginStop() {
     XPLMDestroyMenu(menu_id);
 }
 
-PLUGIN_API void XPluginDisable() {
-    XPLMUnregisterCommandHandler(ir_training_cmd, toggle_ir_training, false, NULL);
-    XPLMDestroyFlightLoop(ctrl_loop_id);
-    XPLMDestroyFlightLoop(data_loop_id);
-    XPLMDestroyFlightLoop(gdl90_loop_id);
-
-    if (!teleport_window) {
-        XPLMDestroyWindow(teleport_window);
-    }
-
-    if (xps) {
-        delete xps;
-        xps = NULL;
-    } else {
-        print_debug("XP server should not be NULL!");
-    }
-    print_debug("XPS is disabled");
-    if (gdl90) {
-        delete gdl90;
-        gdl90 = NULL;
-    } else {
-        print_debug("GDL90 server should not be NULL!");
-    }
-    print_debug("GDL90 is disabled");
-}
-
 PLUGIN_API int XPluginEnable() {
     GDL90::crc_init();
 
@@ -1167,7 +1120,7 @@ PLUGIN_API int XPluginEnable() {
     XPLMCreateFlightLoop_t loop_cfg;
     loop_cfg.structSize = sizeof(XPLMCreateFlightLoop_t);
     loop_cfg.phase = xplm_FlightLoop_Phase_AfterFlightModel;
-    loop_cfg.refcon = NULL;
+    loop_cfg.refcon = nullptr;
     loop_cfg.callbackFunc = ctrl_loop;
     ctrl_loop_id = XPLMCreateFlightLoop(&loop_cfg);
     XPLMScheduleFlightLoop(ctrl_loop_id, -1, 1);
@@ -1183,8 +1136,35 @@ PLUGIN_API int XPluginEnable() {
     ir_training_cmd = XPLMCreateCommand(
             "lfd/toggle_imc_foggles",
             "Toggle IR training mode. This will toggle the outside vision (IMC and back to the original condition) and also toggle the G1000 PFD/MFD display.");
-    XPLMRegisterCommandHandler(ir_training_cmd, toggle_ir_training, false, NULL);
+    XPLMRegisterCommandHandler(ir_training_cmd, toggle_ir_training, false, nullptr);
     return 1;
+}
+
+PLUGIN_API void XPluginDisable() {
+    XPLMUnregisterCommandHandler(ir_training_cmd, toggle_ir_training, false, nullptr);
+    XPLMDestroyFlightLoop(ctrl_loop_id);
+    XPLMDestroyFlightLoop(data_loop_id);
+    XPLMDestroyFlightLoop(gdl90_loop_id);
+
+    if (teleport_window) {
+        XPLMDestroyWindow(teleport_window);
+        teleport_window = 0;
+    }
+
+    if (xps) {
+        delete xps;
+        xps = nullptr;
+    } else {
+        print_debug("XP server should not be nullptr!");
+    }
+    print_debug("XPS is disabled");
+    if (gdl90) {
+        delete gdl90;
+        gdl90 = nullptr;
+    } else {
+        print_debug("GDL90 server should not be nullptr!");
+    }
+    print_debug("GDL90 is disabled");
 }
 
 PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int msg, void*) {}
