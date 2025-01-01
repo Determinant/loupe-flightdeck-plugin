@@ -835,6 +835,7 @@ int toggle_ir_training(XPLMCommandRef, XPLMCommandPhase phase, void *) {
     XPLMCommandOnce(cmd_ref);
     static const float cloud_ir[9] = {0.0, 10000.0, 11000.0, 10000.0, 11000.0, 21000.0, 6, 6, 6};
     static XPLMDataRef cloud_drefs[9];
+    static bool foggles_on = false;
     for (int i = 0; i < 3; i++) {
         static char buff[64];
         sprintf(buff, "sim/weather/cloud_base_msl_m[%d]", i);
@@ -844,18 +845,22 @@ int toggle_ir_training(XPLMCommandRef, XPLMCommandPhase phase, void *) {
         sprintf(buff, "sim/weather/cloud_coverage[%d]", i);
         cloud_drefs[i + 6] = XPLMFindDataRef(buff);
     }
-    if (XPLMGetDataf(cloud_drefs[0]) < EPS) {
+    if (foggles_on) {
         print_debug("foggles off...");
         for (int i = 0; i < 9; i++) {
             XPLMSetDataf(cloud_drefs[i], orig_cloud_data[i]);
         }
     } else {
+        bool paused = XPLMGetDatai(XPLMFindDataRef("sim/time/sim_speed")) == 0;
         print_debug("foggles on...");
         for (int i = 0; i < 9; i++) {
-            orig_cloud_data[i] = XPLMGetDataf(cloud_drefs[i]);
+            if (!paused) {
+                orig_cloud_data[i] = XPLMGetDataf(cloud_drefs[i]);
+            }
             XPLMSetDataf(cloud_drefs[i], cloud_ir[i]);
         }
     }
+    foggles_on ^= 1;
     return 0;
 }
 
@@ -1086,18 +1091,18 @@ void menu_handler(void *inMenuRef, void *inItemRef) {
 }
 
 XPLMMenuID menu_id;
+int menu_idx;
 
 PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc) {
     strcpy(outName, "Loupe Flightdeck");
     strcpy(outSig, "com.determinant.loupeflightdeck");
     strcpy(outDesc, "A plugin that reimplements X-Plane's basic UDP API and GDL90 support.");
 
-    auto item = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "Loupe Flightdeck", 0, 1);
-
+    menu_idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "Loupe Flightdeck", 0, 1);
     menu_id = XPLMCreateMenu(
             "Loupe Flightdeck",
             XPLMFindPluginsMenu(),
-            item,
+            menu_idx,
             menu_handler,
             0);
 
@@ -1108,6 +1113,7 @@ PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc) {
 }
 
 PLUGIN_API void	XPluginStop() {
+    XPLMRemoveMenuItem(XPLMFindPluginsMenu(), menu_idx);
     XPLMDestroyMenu(menu_id);
 }
 
