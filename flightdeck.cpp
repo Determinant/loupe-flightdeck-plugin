@@ -721,6 +721,8 @@ XPLMFlightLoopID ctrl_loop_id;
 XPLMFlightLoopID data_loop_id;
 XPLMFlightLoopID gdl90_loop_id;
 XPLMCommandRef ir_training_cmd;
+XPLMCommandRef throttle_full_cmd;
+XPLMCommandRef prop_full_cmd;
 
 float ctrl_loop(float elapsed, float, int, void *) {
     for (;;) {
@@ -822,6 +824,24 @@ float gdl90_loop(float, float, int, void *) {
     gdl90->update_ahrs();
     if (counter == ahrs_factor) counter = 0;
     return interval;
+}
+
+int set_throttle_full(XPLMCommandRef, XPLMCommandPhase phase, void *) {
+    if (phase != xplm_CommandBegin) {
+        return 1;
+    }
+    XPLMDataRef dref = XPLMFindDataRef("sim/cockpit2/engine/actuators/throttle_ratio_all");
+    XPLMSetDataf(dref, 1.0f);
+    return 0;
+}
+
+int set_prop_full(XPLMCommandRef, XPLMCommandPhase phase, void *) {
+    if (phase != xplm_CommandBegin) {
+        return 1;
+    }
+    XPLMDataRef dref = XPLMFindDataRef("sim/cockpit2/engine/actuators/prop_ratio_all");
+    XPLMSetDataf(dref, 1.0f);
+    return 0;
 }
 
 int toggle_ir_training(XPLMCommandRef, XPLMCommandPhase phase, void *) {
@@ -1143,11 +1163,23 @@ PLUGIN_API int XPluginEnable() {
             "lfd/toggle_imc_foggles",
             "Toggle IR training mode. This will toggle the outside vision (IMC and back to the original condition) and also toggle the G1000 PFD/MFD display.");
     XPLMRegisterCommandHandler(ir_training_cmd, toggle_ir_training, false, nullptr);
+    throttle_full_cmd = XPLMCreateCommand(
+            "lfd/throttle_full",
+            "Set throttle to full (for all engines).");
+    XPLMRegisterCommandHandler(throttle_full_cmd, set_throttle_full, false, nullptr);
+    prop_full_cmd = XPLMCreateCommand(
+            "lfd/prop_full",
+            "Set prop to full (for all engines).");
+    XPLMRegisterCommandHandler(prop_full_cmd, set_prop_full, false, nullptr);
+
     return 1;
 }
 
 PLUGIN_API void XPluginDisable() {
     XPLMUnregisterCommandHandler(ir_training_cmd, toggle_ir_training, false, nullptr);
+    XPLMUnregisterCommandHandler(throttle_full_cmd, set_throttle_full, false, nullptr);
+    XPLMUnregisterCommandHandler(prop_full_cmd, set_prop_full, false, nullptr);
+
     XPLMDestroyFlightLoop(ctrl_loop_id);
     XPLMDestroyFlightLoop(data_loop_id);
     XPLMDestroyFlightLoop(gdl90_loop_id);
