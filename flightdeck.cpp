@@ -254,8 +254,16 @@ struct TeleportEvent: public Event {
         if (it != navaid_table.end()) {
             XPLMGetNavAidInfo(it->second, &type, &lat, &lng, &elev, nullptr, nullptr, nullptr, name, nullptr);
             print_debug("teleporting to %s(type=%d, lat=%.6f, lng=%.6f, elev=%.2f)", name, type, lat, lng, elev);
-            auto sim_speed_dref = XPLMFindDataRef("sim/time/sim_speed");
-            XPLMSetDatai(sim_speed_dref, 0);
+
+            auto sim_paused_dref = XPLMFindDataRef("sim/time/paused");
+            if (sim_paused_dref != NULL) {
+                if (XPLMGetDatai(sim_paused_dref) == 0) {
+                    XPLMCommandOnce(XPLMFindCommand("sim/operation/pause_toggle"));
+                }
+            }
+
+            // Set to 65% power
+            XPLMSetDataf(XPLMFindDataRef("sim/cockpit2/engine/actuators/throttle_ratio_all"), 0.65);
 
             size_t n;
 
@@ -286,6 +294,10 @@ struct TeleportEvent: public Event {
             auto psi = XPLMGetDataf(psi_dref) * PI / 180;
             auto mps = kts_to_mps(gs);
 
+            int override = 1;
+            auto override_dref = XPLMFindDataRef("sim/operation/override/override_planepath");
+            XPLMSetDatavi(override_dref, &override, 0, 1);
+
             XPLMSetDatad(local_x_dref, x);
             XPLMSetDatad(local_y_dref, y);
             XPLMSetDatad(local_z_dref, z);
@@ -293,6 +305,9 @@ struct TeleportEvent: public Event {
             XPLMSetDataf(local_vx_dref, mps * sin(psi));
             XPLMSetDataf(local_vz_dref, mps * -cos(psi));
             XPLMSetDataf(local_vy_dref, 0);
+
+            override = 0;
+            XPLMSetDatavi(override_dref, &override, 0, 1);
         } else {
             print_debug("invalid navaid/fix ID: %s", id.c_str());
         }
