@@ -373,9 +373,11 @@ struct UDPServer {
             print_debug("bind failed");
             return;
         }
+    }
 
+    void start() {
         inbound_msg_loop = std::thread([this] {
-            print_debug("inbound message loop is started");
+            fprintf(stderr, "[Loupe Flightdeck] inbound message loop is started\n");
             const size_t BUFFER_SIZE = 65536;
             socklen_t addr_len = sizeof(sockaddr_in);
             struct sockaddr_in client_addr;
@@ -389,11 +391,11 @@ struct UDPServer {
                     break;
                 }
             }
-            print_debug("inbound message loop ended");
+            fprintf(stderr, "[Loupe Flightdeck] inbound message loop ended\n");
         });
 
         outbound_msg_loop = std::thread([this] {
-            print_debug("outbound message loop is started");
+            fprintf(stderr, "[Loupe Flightdeck] outbound message loop is started\n");
             const socklen_t addr_len = sizeof(sockaddr_in);
             for (;;) {
                 std::unique_lock lk{outbound_lock};
@@ -413,22 +415,28 @@ struct UDPServer {
                 outbound_readable = false;
                 lk.unlock();
             }
-            print_debug("outbound message loop ended");
+            fprintf(stderr, "[Loupe Flightdeck] outbound message loop ended\n");
         });
     }
 
     virtual ~UDPServer() {
+        stop();
+    }
+
+    void stop() {
         if (sockfd >= 0) {
             print_debug("shutting down UDP Server");
             shutdown(sockfd, SHUT_RDWR);
             close(sockfd);
-            inbound_msg_loop.join();
+            sockfd = -1;
+
+            if (inbound_msg_loop.joinable()) inbound_msg_loop.join();
 
             outbound_lock.lock();
             outbound_exit = true;
             outbound_cv.notify_all();
             outbound_lock.unlock();
-            outbound_msg_loop.join();
+            if (outbound_msg_loop.joinable()) outbound_msg_loop.join();
         }
     }
 
@@ -451,6 +459,10 @@ struct XPlaneS: public UDPServer {
     static const int PORT = 40086;
 
     XPlaneS(): UDPServer(PORT) {}
+
+    ~XPlaneS() override {
+        stop();
+    }
 
     void on_message(bytes_t buffer, size_t len, SocketAddr from) override {
         //print_debug("got a message %lu", len);
@@ -483,7 +495,7 @@ struct XPlaneS: public UDPServer {
                 return;
             }
         }
-        print_debug("invalid message header");
+        fprintf(stderr, "[Loupe Flightdeck] invalid message header\n");
     }
 };
 
@@ -512,6 +524,10 @@ struct GDL90: public UDPServer {
         hdg_dref = XPLMFindDataRef("sim/flightmodel/position/mag_psi");
         ias_dref = XPLMFindDataRef("sim/flightmodel/position/indicated_airspeed");
         tas_dref = XPLMFindDataRef("sim/flightmodel/position/true_airspeed");
+    }
+
+    ~GDL90() override {
+        stop();
     }
 
     void on_message(bytes_t buffer, size_t len, SocketAddr from) override {
@@ -1156,7 +1172,9 @@ PLUGIN_API int XPluginEnable() {
     GDL90::crc_init();
 
     xps = new XPlaneS();
+    xps->start();
     gdl90 = new GDL90();
+    gdl90->start();
 
     XPLMCreateFlightLoop_t loop_cfg;
     loop_cfg.structSize = sizeof(XPLMCreateFlightLoop_t);
