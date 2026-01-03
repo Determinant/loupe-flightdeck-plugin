@@ -3,13 +3,21 @@ SRC_BASE	:=	.
 TARGET		:= loupe-flightdeck
 
 SOURCES = \
-	flightdeck.cpp
+	flightdeck.cpp \
+	XPImGui.cpp \
+	libs/imgui/imgui.cpp \
+	libs/imgui/imgui_draw.cpp \
+	libs/imgui/imgui_tables.cpp \
+	libs/imgui/imgui_widgets.cpp \
+	libs/imgui/imgui_demo.cpp \
+	libs/imgui/imgui_impl_opengl2.cpp
 
 LIBS = 
 
 INCLUDES = \
 	-I$(SRC_BASE)/xplane-sdk/CHeaders/XPLM \
-	-I$(SRC_BASE)/xplane-sdk/CHeaders/Widgets
+	-I$(SRC_BASE)/xplane-sdk/CHeaders/Widgets \
+	-I$(SRC_BASE)/libs/imgui
 
 DEFINES = -DXPLM200=1 -DXPLM210=1 -DXPLM300=1 -DAPL=0 -DIBM=0 -DLIN=1
 

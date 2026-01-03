@@ -41,6 +41,8 @@
 #include "XPLMGraphics.h"
 #include "XPLMDisplay.h"
 #include "XPLMNavigation.h"
+#include "XPImGui.h"
+#include "imgui.h"
 
 using std::string;
 
@@ -147,6 +149,25 @@ std::queue<std::pair<float, subid_t>> stops;
 std::unordered_map<subid_t, std::shared_ptr<Subscription>> id2sub; // id -> subscription
 std::unordered_map<int32_t, std::unordered_map<subid_t, std::shared_ptr<Subscription>>> next_plan; // freq -> id -> subscription
 
+static std::unique_ptr<std::unordered_map<string, XPLMNavRef>> navaid_table;
+
+void navaid_table_init() {
+    if (navaid_table) return;
+    navaid_table = std::make_unique<std::unordered_map<string, XPLMNavRef>>();
+    auto nav = XPLMGetFirstNavAid();
+    char id[256];
+    float lat, lng;
+    while (nav != XPLM_NAV_NOT_FOUND) {
+        XPLMGetNavAidInfo(nav, nullptr, &lat, &lng, nullptr, nullptr, nullptr, id, nullptr, nullptr);
+        string id_str(id);
+        if (navaid_table->count(id_str) == 0 ||
+            (-162 < lng && lng < -68)) { // keep the US area for ambiguous navaids
+            (*navaid_table)[id_str] = nav;
+        }
+        nav = XPLMGetNextNavAid(nav);
+    }
+}
+
 struct Event {
     virtual void handle() = 0;
     virtual ~Event() {}
@@ -207,26 +228,6 @@ struct DataSubscribeEvent: public Event {
     }
 };
 
-std::unordered_map<string, XPLMNavRef> navaid_table;
-
-void navaid_table_init() {
-    static bool navaid_table_initialized = false;
-    if (navaid_table_initialized) return;
-    navaid_table_initialized = true;
-    auto nav = XPLMGetFirstNavAid();
-    char id[32];
-    float lat, lng;
-    while (nav != XPLM_NAV_NOT_FOUND) {
-        XPLMGetNavAidInfo(nav, nullptr, &lat, &lng, nullptr, nullptr, nullptr, id, nullptr, nullptr);
-        string id_str(id);
-        if (navaid_table.count(id_str) == 0 ||
-            (-162 < lng && lng < -68)) { // keep the US area for ambiguous navaids
-            navaid_table[id_str] = nav;
-        }
-        nav = XPLMGetNextNavAid(nav);
-    }
-}
-
 double get_elevation() {
     auto dref = XPLMFindDataRef("sim/flightmodel/position/elevation");
     return XPLMGetDatad(dref);
@@ -250,8 +251,8 @@ struct TeleportEvent: public Event {
         float lat, lng, elev;
         char name[256];
         navaid_table_init();
-        auto it = navaid_table.find(id);
-        if (it != navaid_table.end()) {
+        auto it = navaid_table->find(id);
+        if (it != navaid_table->end()) {
             XPLMGetNavAidInfo(it->second, &type, &lat, &lng, &elev, nullptr, nullptr, nullptr, name, nullptr);
             print_debug("teleporting to %s(type=%d, lat=%.6f, lng=%.6f, elev=%.2f)", name, type, lat, lng, elev);
 
@@ -427,8 +428,9 @@ struct UDPServer {
         if (sockfd >= 0) {
             print_debug("shutting down UDP Server");
             shutdown(sockfd, SHUT_RDWR);
-            close(sockfd);
-            sockfd = -1;
+            // Close after threads are joined to avoid race conditions
+            //close(sockfd);
+            //sockfd = -1;
 
             if (inbound_msg_loop.joinable()) inbound_msg_loop.join();
 
@@ -437,6 +439,9 @@ struct UDPServer {
             outbound_cv.notify_all();
             outbound_lock.unlock();
             if (outbound_msg_loop.joinable()) outbound_msg_loop.join();
+
+            close(sockfd);
+            sockfd = -1;
         }
     }
 
@@ -915,181 +920,59 @@ int toggle_ir_training(XPLMCommandRef, XPLMCommandPhase phase, void *) {
     return 0;
 }
 
-struct GLWidget {
-    virtual bool is_inside(float x, float y) { return false; }
-    virtual void render(float x, float y, bool focused) = 0;
-    virtual void on_keypress(char key, XPLMKeyFlags flag) {}
-    virtual void on_mouse(XPLMMouseStatus status) {}
-    virtual void on_focus() {}
-};
-
 XPLMWindowID teleport_window = 0;
-std::vector<std::unique_ptr<GLWidget>> teleport_window_widgets;
-ssize_t teleport_window_widgets_focused = -1;
+char fix_buffer[32] = "";
+float alt_val = 0.0f;
+float gs_val = 0.0f;
 
-struct GLTextInput: GLWidget {
-    float l, r, t, b;
-    string text;
-
-    GLTextInput(float l, float b, float w, float h): \
-        l(l), r(l + w), t(b + h), b(b), text("") {}
-    bool is_inside(float x, float y) override {
-        return l < x && x < r && b < y && y < t; 
-    }
-    virtual bool verify_input(string &edited) {
-        return true;
-    }
-    void on_keypress(char key, XPLMKeyFlags flag) override {
-        if (!(flag & xplm_DownFlag)) {
-            return;
-        }
-        if (isprint(key)) {
-            auto edited = text + key;
-            if (verify_input(edited)) {
-                text = edited;
-            }
-        } else if (key == '\b' && text.length() > 0) {
-            text.resize(text.length() - 1);
-        }
-    }
-    void render(float x, float y, bool focused) override {
-        float col[3] = {1, 1, 1};
-        if (!focused) {
-            col[0] = 0.5;
-            col[1] = 0.5;
-            col[2] = 0.5;
-        }
-        glColor3fv(col);
-        glRectf(x + l, y + t, x + r, y + b);
-        float white[] = {0, 0, 0};
-        XPLMDrawString(white, x + l + 5, y + t - 10, text.c_str(), nullptr, xplmFont_Proportional);
-    }
-};
-
-struct GLFixInput: public GLTextInput {
-    using GLTextInput::GLTextInput;
-
-    bool verify_input(string &edited) override {
-        std::transform(edited.begin(), edited.end(), edited.begin(), ::toupper);
-        return std::regex_match(edited, std::regex("[A-Z0-9.]*"));
-    }
-};
-
-struct GLAltInput: public GLTextInput {
-    using GLTextInput::GLTextInput;
-
-    bool verify_input(string &edited) override {
-        return std::regex_match(edited, std::regex("[-0-9.]*"));
-    }
-
-    void on_focus() override {
-        if (text.length() == 0) {
-            text = to_string_with_precision(meter_to_feet(get_elevation()), 0);
-        }
-    }
-};
-
-struct GLGSInput: public GLTextInput {
-    using GLTextInput::GLTextInput;
-
-    bool verify_input(string &edited) override {
-        return std::regex_match(edited, std::regex("[0-9.]*"));
-    }
-
-    void on_focus() override {
-        if (text.length() == 0) {
-            text = to_string_with_precision(std::max(0.0f, get_groundspeed()), 0);
-        }
-    }
-};
-
-struct GLButton: GLWidget {
-    float l, r, t, b;
-    string text;
-    bool down;
-
-    GLButton(float x0, float y0, const char *text, float w): l(x0), r(x0 + w), t(y0 + 15), b(y0), text(text), down(false) {}
-    bool is_inside(float x, float y) override {
-        return l < x && x < r && b < y && y < t; 
-    }
-    void on_mouse(XPLMMouseStatus status) override {
-        switch (status) {
-            case xplm_MouseDown: {
-                down = true;
-                string id = dynamic_cast<GLFixInput*>(teleport_window_widgets[1].get())->text;
-                string alt = dynamic_cast<GLAltInput*>(teleport_window_widgets[3].get())->text;
-                string gs = dynamic_cast<GLGSInput*>(teleport_window_widgets[5].get())->text;
-                xps->events.push(std::unique_ptr<Event>(new TeleportEvent(id, alt, gs)));
-            }
-            break;
-            case xplm_MouseUp: down = false; break;
-            case xplm_MouseDrag: down = true; break;
-        }
-    }
-    void render(float x, float y, bool) override {
-        float col[3] = {0.4218, 0.5391, 0.9297};
-        float white[] = {0, 0, 0};
-        if (down) {
-            for (auto &c: col) c = 1 - c;
-            for (auto &w: white) w = 1 - w;
-        }
-        glColor3fv(col);
-        glRectf(x + l, y + t, x + r, y + b);
-        XPLMDrawString(white, x + l + 10, y + t - 10, text.c_str(), nullptr, xplmFont_Proportional);
-    }
-};
-
-
-struct GLTextLabel: GLWidget {
-    float x0, y0;
-    string text;
-    GLTextLabel(float x0, float y0, const char *text): x0(x0), y0(y0), text(text) {}
-    void render(float x, float y, bool) override {
-        float col[] = {1.0, 1.0, 1.0};
-        XPLMDrawString(col, x0 + x, y0 + y, text.c_str(), nullptr, xplmFont_Proportional);
-    }
-};
-
-int teleport_window_on_mouse_click(XPLMWindowID id, int x, int y, XPLMMouseStatus status, void *) {
-    int l, t, r, b;
-    XPLMGetWindowGeometry(id, &l, &t, &r, &b);
-
+int teleport_window_on_mouse_click(XPLMWindowID id, int x, int y, XPLMMouseStatus status, void *refcon) {
     if (status == xplm_MouseDown) {
-        teleport_window_widgets_focused = -1;
+        XPLMTakeKeyboardFocus(id);
     }
-    for (size_t i = 0; i < teleport_window_widgets.size(); i++) {
-        const auto &w = teleport_window_widgets[i];
-        if (w->is_inside(x - l, y - t)) {
-            if (status == xplm_MouseDown) {
-                teleport_window_widgets_focused = i;
-                w->on_focus();
-            }
-            w->on_mouse(status);
-            XPLMTakeKeyboardFocus(id);
-            return 1;
-        }
-    }
-    return 0;
+    return XPImGui::HandleMouseClick(id, x, y, status, refcon);
 }
 
-void teleport_window_on_keyboard(XPLMWindowID id, char key, XPLMKeyFlags flag, char inVirtualKey, void *, int losing_focus) {
-    if (id != teleport_window || losing_focus) {
-        return;
-    }
-    if (teleport_window_widgets_focused < 0) {
-        return;
-    }
-    const auto &w = teleport_window_widgets[teleport_window_widgets_focused];
-    w->on_keypress(key, flag);
+void teleport_window_on_keyboard(XPLMWindowID id, char key, XPLMKeyFlags flag, char virtualKey, void *refcon, int losing_focus) {
+    XPImGui::HandleKey(id, key, flag, virtualKey, refcon, losing_focus);
 }
 
 void teleport_window_on_draw(XPLMWindowID id, void* refcon) {
-    XPLMSetGraphicsState(0, 0, 0, 0, 1, 1, 0);
-    int l, t, r, b;
-    XPLMGetWindowGeometry(id, &l, &t, &r, &b);
-    for (size_t i = 0; i < teleport_window_widgets.size(); i++) {
-        teleport_window_widgets[i]->render(l, t, ssize_t(i) == teleport_window_widgets_focused);
+    if (!XPImGui::NewFrame(id)) return;
+
+    // Create a fullscreen window inside the X-Plane window
+    // Flags: NoTitleBar | NoResize | NoMove (since the container X-Plane window handles this)
+    ImGui::Begin("Teleport Content", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBackground);
+    
+    ImGui::Text("Enter the fix:");
+    ImGui::InputText("##fix", fix_buffer, sizeof(fix_buffer));
+    
+    ImGui::Text("Altitude (ft.):");
+    ImGui::InputFloat("##alt", &alt_val, 100.0f, 1000.0f, "%.0f");
+    ImGui::SameLine();
+    if (ImGui::Button("Current##alt")) {
+        alt_val = meter_to_feet(get_elevation());
     }
+    
+    ImGui::Text("GS (kts.):");
+    ImGui::InputFloat("##gs", &gs_val, 10.0f, 50.0f, "%.0f");
+    ImGui::SameLine();
+    if (ImGui::Button("Current##gs")) {
+        gs_val = mps_to_kts(std::max(0.0f, get_groundspeed()));
+    }
+    
+    ImGui::Separator();
+    ImGui::Spacing();
+    
+    if (ImGui::Button("Go!", ImVec2(120, 35))) {
+        // Trigger Teleport Event
+        string id_str(fix_buffer);
+        string alt_str = std::to_string(alt_val);
+        string gs_str = std::to_string(gs_val);
+        xps->events.push(std::unique_ptr<Event>(new TeleportEvent(id_str, alt_str, gs_str)));
+    }
+
+    ImGui::End();
+    XPImGui::Render();
 }
 
 void menu_handler(void *inMenuRef, void *inItemRef) {
@@ -1102,16 +985,8 @@ void menu_handler(void *inMenuRef, void *inItemRef) {
         break;
         case 1: {
             if (!teleport_window) {
-                teleport_window_widgets.push_back(std::make_unique<GLTextLabel>(10, -15, "Enter the fix:"));
-                teleport_window_widgets.push_back(std::make_unique<GLFixInput>(100, -20, 100, 15));
-                teleport_window_widgets.push_back(std::make_unique<GLTextLabel>(10, -35, "Altitude (ft.):"));
-                teleport_window_widgets.push_back(std::make_unique<GLAltInput>(100, -40, 100, 15));
-                teleport_window_widgets.push_back(std::make_unique<GLTextLabel>(10, -55, "GS (kts.):"));
-                teleport_window_widgets.push_back(std::make_unique<GLGSInput>(100, -60, 100, 15));
-                teleport_window_widgets.push_back(std::make_unique<GLButton>(10, -100, "Go!", 50));
-
                 int x0 = 500, y0 = 500;
-                int w = 300, h = 150;
+                int w = 300, h = 250; // Slightly taller for ImGui spacing
                 XPLMCreateWindow_t win;
                 win.structSize = sizeof(win);
                 win.left = x0;
@@ -1131,6 +1006,11 @@ void menu_handler(void *inMenuRef, void *inItemRef) {
                 XPLMSetWindowPositioningMode(teleport_window, xplm_WindowPositionFree, -1);
                 XPLMSetWindowResizingLimits(teleport_window, w, h, w, h);
                 XPLMSetWindowTitle(teleport_window, "Teleport To");
+                
+                // Initialize defaults
+                if (strlen(fix_buffer) == 0) strcpy(fix_buffer, "KSEA");
+                alt_val = meter_to_feet(get_elevation());
+                gs_val = mps_to_kts(std::max(0.0f, get_groundspeed()));
             } else {
                 XPLMSetWindowIsVisible(teleport_window, 1);
             }
@@ -1160,6 +1040,7 @@ PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc) {
     XPLMAppendMenuItem(menu_id, "Toggle Foggles", (void *)0, 1);
     XPLMAppendMenuItem(menu_id, "Teleport to Fix", (void *)1, 1);
     XPLMAppendMenuItem(menu_id, "Reload Plugins", (void *)2, 1);
+    
     return 1;
 }
 
@@ -1169,6 +1050,7 @@ PLUGIN_API void	XPluginStop() {
 }
 
 PLUGIN_API int XPluginEnable() {
+    XPImGui::Init();
     GDL90::crc_init();
 
     xps = new XPlaneS();
@@ -1236,6 +1118,17 @@ PLUGIN_API void XPluginDisable() {
         print_debug("GDL90 server should not be nullptr!");
     }
     print_debug("GDL90 is disabled");
+    
+    // Clear global containers
+    std::queue<std::pair<float, subid_t>> empty_stops;
+    std::swap(stops, empty_stops);
+    id2sub.clear();
+    next_plan.clear();
+    
+    if (navaid_table) {
+        navaid_table->clear();
+        navaid_table.reset();
+    }
 }
 
 PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int msg, void*) {}
