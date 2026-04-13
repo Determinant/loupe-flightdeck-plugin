@@ -4,6 +4,7 @@
 #include <XPLMUtilities.h>
 #include <XPLMGraphics.h>
 #include <XPLMProcessing.h>
+#include <cmath>
 
 // On Linux/Mac, X-Plane provides GL symbols.
 #if LIN
@@ -16,6 +17,35 @@
 
 namespace XPImGui {
 
+    namespace {
+        static constexpr float kBaseFontPx = 13.0f;
+
+        struct XPImGuiState {
+            bool renderer_inited = false;
+            float scale = 1.0f;
+            int screen_bounds_l = 0;
+            int screen_bounds_t = 0;
+            float last_scale = -1.0f;
+            float last_font_scale = -1.0f;
+            float last_time = 0.0f;
+        };
+
+        XPImGuiState state{};
+
+        static void rebuild_fonts_for_scale(float scale) {
+            ImGuiIO& io = ImGui::GetIO();
+            ImFontConfig cfg{};
+            cfg.SizePixels = kBaseFontPx * std::max(scale, 1.0f);
+            io.Fonts->Clear();
+            io.Fonts->AddFontDefault(&cfg);
+            if (state.renderer_inited) {
+                ImGui_ImplOpenGL2_DestroyFontsTexture();
+                ImGui_ImplOpenGL2_CreateFontsTexture();
+            }
+            state.last_font_scale = scale;
+        }
+    } // namespace
+
     void Init() {
         if (ImGui::GetCurrentContext()) return;
         Reset();
@@ -26,58 +56,60 @@ namespace XPImGui {
         io.IniFilename = nullptr;
 
         ImGui::StyleColorsDark();
-        
-        // Initialize OpenGL2 backend
-        ImGui_ImplOpenGL2_Init(); 
+        state.renderer_inited = false;
     }
 
     void Shutdown() {
         if (!ImGui::GetCurrentContext()) return;
-        ImGui_ImplOpenGL2_Shutdown();
+        // During plugin disable/reload on XP11 Linux the GL context lifecycle can be fragile.
+        // Avoid backend GL teardown here to reduce reload-time crashes.
+        state.renderer_inited = false;
         ImGui::DestroyContext();
+        Reset();
     }
-    
-    // Store globals for mouse handling
-    static float g_scale = 1.0f;
-    static int g_screen_bounds_l = 0;
-    static int g_screen_bounds_t = 0;
-    static float g_last_scale = -1.0f;
-    static float g_last_time = 0.0f;
 
     void Reset() {
-        g_scale = 1.0f;
-        g_screen_bounds_l = 0;
-        g_screen_bounds_t = 0;
-        g_last_scale = -1.0f;
-        g_last_time = 0.0f;
+        state.scale = 1.0f;
+        state.screen_bounds_l = 0;
+        state.screen_bounds_t = 0;
+        state.last_scale = -1.0f;
+        state.last_font_scale = -1.0f;
+        state.last_time = 0.0f;
+        state.renderer_inited = false;
     }
 
     bool NewFrame(XPLMWindowID inWindowID) {
         if (!ImGui::GetCurrentContext()) return false;
+        if (!state.renderer_inited) {
+            ImGui_ImplOpenGL2_Init();
+            state.renderer_inited = true;
+        }
 
         // Get Logical Screen Bounds (Points)
         int sl, st, sr, sb;
         XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);
-        g_screen_bounds_l = sl;
-        g_screen_bounds_t = st;
+        state.screen_bounds_l = sl;
+        state.screen_bounds_t = st;
         int screen_w_pts = sr - sl;
-        
+
         // Get Physical Viewport (Pixels)
         GLint vp[4];
         glGetIntegerv(GL_VIEWPORT, vp);
         int screen_w_px = vp[2];
         int screen_h_px = vp[3];
 
-        // Calculate HiDPI Scale
-        float scale = (float)screen_w_px / (float)screen_w_pts;
-        
-        // Update ImGui Style Scaling if changed
-        if (std::abs(scale - g_last_scale) > 0.001f) {
-            ImGui::GetStyle().ScaleAllSizes(scale / (g_last_scale > 0 ? g_last_scale : 1.0f));
-            ImGui::GetIO().FontGlobalScale = scale;
-            g_last_scale = scale;
+        // Calculate HiDPI scale
+        float scale = screen_w_pts > 0 ? ((float)screen_w_px / (float)screen_w_pts) : 1.0f;
+        state.scale = scale;
+
+        // Update style and font atlas at the effective UI/device scale.
+        if (std::abs(scale - state.last_scale) > 0.001f) {
+            ImGui::GetStyle().ScaleAllSizes(scale / (state.last_scale > 0.0f ? state.last_scale : 1.0f));
+            state.last_scale = scale;
         }
-        g_scale = scale;
+        if (std::abs(scale - state.last_font_scale) > 0.001f) {
+            rebuild_fonts_for_scale(scale);
+        }
 
         int l, t, r, b;
         XPLMGetWindowGeometry(inWindowID, &l, &t, &r, &b);
@@ -86,21 +118,22 @@ namespace XPImGui {
         
         ImGuiIO& io = ImGui::GetIO();
         io.DisplaySize = ImVec2((float)screen_w_px, (float)screen_h_px);
+        io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
         
         float now = XPLMGetElapsedTime();
-        io.DeltaTime = (g_last_time > 0) ? (now - g_last_time) : (1.0f / 60.0f);
-        g_last_time = now;
+        io.DeltaTime = (state.last_time > 0) ? (now - state.last_time) : (1.0f / 60.0f);
+        state.last_time = now;
 
         ImGui_ImplOpenGL2_NewFrame();
         ImGui::NewFrame();
         
         // Position window in Pixel Space
         // (Global_L - Screen_L) * Scale
-        float imgui_x = (float)(l - sl) * scale;
-        float imgui_y = (float)(st - t) * scale;
+        float imgui_x = (float)(l - sl) * state.scale;
+        float imgui_y = (float)(st - t) * state.scale;
         
         ImGui::SetNextWindowPos(ImVec2(imgui_x, imgui_y));
-        ImGui::SetNextWindowSize(ImVec2(w * scale, h * scale));
+        ImGui::SetNextWindowSize(ImVec2(w * state.scale, h * state.scale));
         ImGui::SetNextWindowBgAlpha(0.0f); 
         return true;
     }
@@ -125,8 +158,8 @@ namespace XPImGui {
         // x_px = (x - sl) * scale
         // y_px = (st - y) * scale  [ImGui Y is down]
         
-        float local_x = (float)(x - g_screen_bounds_l) * g_scale;
-        float local_y = (float)(g_screen_bounds_t - y) * g_scale;
+        float local_x = (float)(x - state.screen_bounds_l) * state.scale;
+        float local_y = (float)(state.screen_bounds_t - y) * state.scale;
         io.AddMousePosEvent(local_x, local_y);
 
         if (inMouseStatus == xplm_MouseDown) {
@@ -147,7 +180,7 @@ namespace XPImGui {
         if (inFlags & xplm_DownFlag) {
             // Pass characters directly
             if (inKey != 0) {
-                 io.AddInputCharacter(inKey);
+                 io.AddInputCharacter(static_cast<unsigned int>(static_cast<unsigned char>(inKey)));
             }
             
             // Map keys

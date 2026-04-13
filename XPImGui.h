@@ -1,27 +1,24 @@
 #pragma once
 
 #include "XPLMDisplay.h"
-#include <string>
 
 namespace XPImGui {
-    // Initialize the ImGui context and backend
+    // Initialize ImGui context. The OpenGL backend is initialized lazily in NewFrame().
     void Init();
-    
-    // Shutdown the ImGui context
+
+    // Shutdown ImGui backend/context.
     void Shutdown();
 
-    // Reset internal state (call this during Init)
+    // Reset internal state used for input and frame timing.
     void Reset();
-    
-    // Process X-Plane events and pass them to ImGui
-    // Returns 1 if ImGui captured the event, 0 otherwise
+
+    // Forward X-Plane input events to ImGui.
     int HandleMouseClick(XPLMWindowID inWindowID, int x, int y, XPLMMouseStatus inMouseStatus, void *inRefcon);
     void HandleKey(XPLMWindowID inWindowID, char inKey, XPLMKeyFlags inFlags, char inVirtualKey, void *inRefcon, int losingFocus);
-    
-    // Begin a new frame (call this at the start of your draw callback)
-    // Returns true if a new frame was started, false otherwise (e.g. if context is null)
+
+    // Begin a new ImGui frame from an X-Plane window draw callback.
     bool NewFrame(XPLMWindowID inWindowID);
-    
-    // Render the frame (call this at the end of your draw callback)
+
+    // Render current ImGui draw data.
     void Render();
 }

@@ -9,7 +9,6 @@ SOURCES = \
 	libs/imgui/imgui_draw.cpp \
 	libs/imgui/imgui_tables.cpp \
 	libs/imgui/imgui_widgets.cpp \
-	libs/imgui/imgui_demo.cpp \
 	libs/imgui/imgui_impl_opengl2.cpp
 
 LIBS = 
@@ -20,6 +19,7 @@ INCLUDES = \
 	-I$(SRC_BASE)/libs/imgui
 
 DEFINES = -DXPLM200=1 -DXPLM210=1 -DXPLM300=1 -DAPL=0 -DIBM=0 -DLIN=1
+OPTFLAGS ?= -O2
 
 ############################################################################
 
@@ -36,7 +36,7 @@ CXXOBJECTS64	:= $(patsubst %.cpp, $(BUILDDIR)/obj64/%.o, $(CXXSOURCES))
 ALL_DEPS64		:= $(sort $(CDEPS64) $(CXXDEPS64))
 ALL_OBJECTS64	:= $(sort $(COBJECTS64) $(CXXOBJECTS64))
 
-CFLAGS := $(DEFINES) $(INCLUDES) -fPIC -fvisibility=hidden -Wall -g -O2
+CFLAGS := $(DEFINES) $(INCLUDES) -fPIC -fvisibility=hidden -Wall -g $(OPTFLAGS)
 
 
 # Phony directive tells make that these are "virtual" targets, even if a file named "clean" exists.
@@ -88,5 +88,3 @@ clean:
 # header is changed, the primary header had it before (and is unchanged)
 # so that is in the dependency file too.
 -include $(ALL_DEPS64)
-
-

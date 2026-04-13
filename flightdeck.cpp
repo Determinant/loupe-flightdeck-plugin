@@ -4,34 +4,23 @@
 #include <cstdlib>
 #include <cstdarg>
 #include <cmath>
+#include <cctype>
+#include <cerrno>
 #include <memory>
 #include <optional>
 #include <thread>
-#include <condition_variable>
 #include <queue>
 #include <mutex>
+#include <atomic>
 #include <unordered_map>
 #include <string>
 #include <algorithm>
-#include <regex>
 
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
-
-#if IBM
-    #include <GL/wglew.h>
-    #include <Windows.h>
-#endif
-#if LIN
-    #include <GL/gl.h>
-#elif __GNUC__
-    #include <OpenGL/gl.h>
-#else
-    #include <gl/GL.h>
-#endif
 
 #include "XPLMMenus.h"
 #include "XPLMUtilities.h"
@@ -52,6 +41,32 @@ const double FEET_PER_M = 3.28084;
 
 typedef uint8_t *bytes_t;
 
+static uint32_t read_le_u32(const uint8_t *src) {
+    uint32_t v;
+    std::memcpy(&v, src, sizeof(v));
+    return le32toh(v);
+}
+
+static void write_le_u32(uint8_t *dst, uint32_t value) {
+    uint32_t v = htole32(value);
+    std::memcpy(dst, &v, sizeof(v));
+}
+
+static void write_be_u16(uint8_t *dst, uint16_t value) {
+    uint16_t v = htobe16(value);
+    std::memcpy(dst, &v, sizeof(v));
+}
+
+static void write_be_u32(uint8_t *dst, uint32_t value) {
+    uint32_t v = htobe32(value);
+    std::memcpy(dst, &v, sizeof(v));
+}
+
+static void write_be_u64(uint8_t *dst, uint64_t value) {
+    uint64_t v = htobe64(value);
+    std::memcpy(dst, &v, sizeof(v));
+}
+
 double meter_to_feet(double m) {
     return m * FEET_PER_M;
 }
@@ -68,21 +83,18 @@ double mps_to_kts(double v) {
     return v / 0.514444;
 }
 
-string to_string_with_precision(const double v, const int n = 4) {
-    std::ostringstream out;
-    out.precision(n);
-    out << std::fixed << v;
-    return std::move(out).str();
-}
-
 void print_debug(const char *fmt, ...) {
     string prefixed = string("[Loupe Flightdeck] ") + fmt + "\n";
     const char *fmt_ = prefixed.c_str();
     va_list ap;
     va_start(ap, fmt);
-    char *p;
-    vasprintf(&p, fmt_, ap);
+    char *p = nullptr;
+    const int rc = vasprintf(&p, fmt_, ap);
     va_end(ap);
+    if (rc < 0 || !p) {
+        XPLMDebugString("[Loupe Flightdeck] logging failed\n");
+        return;
+    }
     XPLMDebugString(p);
     free(p);
 }
@@ -98,7 +110,7 @@ struct SocketAddr {
     SocketAddr(struct sockaddr_in &addr): ip(addr.sin_addr.s_addr), port(addr.sin_port) {}
 
     struct sockaddr_in get_sockaddr_in() const {
-        struct sockaddr_in addr;
+        struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = ip;
         addr.sin_port = port;
@@ -122,50 +134,49 @@ template<> struct std::hash<subid_t> {
 struct Subscription {
     int32_t id;
     int32_t freq;
-    XPLMDataRef dataref;
-    XPLMDataTypeID datatype;
+    string dataref_path;
     std::optional<uint8_t> idx;
     SocketAddr from;
 
     Subscription(int32_t id, int32_t freq,
-                XPLMDataRef dataref,
-                XPLMDataTypeID datatype,
+                string dataref_path,
                 std::optional<uint8_t> idx,
-                SocketAddr from): id(id), freq(freq),
-                                dataref(dataref), datatype(datatype), idx(idx), from(from) {}
-
-    void print() {
-        string output = "<sub ";
-        output += "id=" + std::to_string(id) + \
-                ",freq=" + std::to_string(freq) + \
-                ",dataref=" + std::to_string((uintptr_t)dataref) + \
-                ",datatype=" + std::to_string((uintptr_t)datatype) + \
-                (idx.has_value() ? ",idx=" + std::to_string(idx.value()) : "")+ ">";
-        print_debug(output.c_str());
-    }
+                SocketAddr from):
+        id(id),
+        freq(freq),
+        dataref_path(std::move(dataref_path)),
+        idx(idx),
+        from(from) {}
 };
 
 std::queue<std::pair<float, subid_t>> stops;
 std::unordered_map<subid_t, std::shared_ptr<Subscription>> id2sub; // id -> subscription
 std::unordered_map<int32_t, std::unordered_map<subid_t, std::shared_ptr<Subscription>>> next_plan; // freq -> id -> subscription
 
-static std::unique_ptr<std::unordered_map<string, XPLMNavRef>> navaid_table;
+static std::unordered_map<string, XPLMNavRef> navaid_table;
+static bool navaid_table_initialized = false;
 
-void navaid_table_init() {
-    if (navaid_table) return;
-    navaid_table = std::make_unique<std::unordered_map<string, XPLMNavRef>>();
+static void navaid_table_init() {
+    if (navaid_table_initialized) return;
+    navaid_table_initialized = true;
+    navaid_table.clear();
     auto nav = XPLMGetFirstNavAid();
     char id[256];
     float lat, lng;
     while (nav != XPLM_NAV_NOT_FOUND) {
         XPLMGetNavAidInfo(nav, nullptr, &lat, &lng, nullptr, nullptr, nullptr, id, nullptr, nullptr);
         string id_str(id);
-        if (navaid_table->count(id_str) == 0 ||
+        if (navaid_table.count(id_str) == 0 ||
             (-162 < lng && lng < -68)) { // keep the US area for ambiguous navaids
-            (*navaid_table)[id_str] = nav;
+            navaid_table[id_str] = nav;
         }
         nav = XPLMGetNextNavAid(nav);
     }
+}
+
+static void navaid_table_reset() {
+    navaid_table.clear();
+    navaid_table_initialized = false;
 }
 
 struct Event {
@@ -176,15 +187,15 @@ struct Event {
 struct CommandEvent: public Event {
     string cmd;
     
-    CommandEvent(const char *cmd): cmd(cmd) {}
+    explicit CommandEvent(string cmd): cmd(std::move(cmd)) {}
     ~CommandEvent() override {}
 
     void handle() override {
         XPLMCommandRef cmd_ref = XPLMFindCommand(cmd.c_str());
         if (!cmd_ref) {
             print_debug("command not found: %s", cmd.c_str());
+            return;
         }
-        //print_debug("executing command: %s %x", cmd.c_str(), cmd_ref);
         XPLMCommandOnce(cmd_ref);
     }
 };
@@ -195,8 +206,8 @@ struct DataSubscribeEvent: public Event {
     int32_t id;
     SocketAddr from;
     
-    DataSubscribeEvent(const char *dataref, int32_t freq, int32_t id, SocketAddr from):
-        dataref(dataref), freq(freq), id(id), from(from) {}
+    DataSubscribeEvent(string dataref, int32_t freq, int32_t id, SocketAddr from):
+        dataref(std::move(dataref)), freq(freq), id(id), from(from) {}
     ~DataSubscribeEvent() override {}
 
     void handle() override {
@@ -207,43 +218,59 @@ struct DataSubscribeEvent: public Event {
                 auto prefix = dataref.substr(0, array_pos);
                 size_t n;
                 auto idx_str = dataref.substr(array_pos + 1, dataref.length() - 2 - array_pos);
-                auto idx_num = std::stoi(idx_str, &n);
+                int idx_num = -1;
+                try {
+                    idx_num = std::stoi(idx_str, &n);
+                } catch (...) {
+                    print_debug("invalid dataref index syntax: %s", dataref.c_str());
+                    return;
+                }
                 if (n != idx_str.length() || idx_num < 0) {
                     return;
                 }
+                if (idx_num > 255) {
+                    print_debug("dataref index out of range: %d (%s)", idx_num, dataref.c_str());
+                    return;
+                }
                 dataref = prefix;
-                idx = std::optional(idx_num);
+                idx = static_cast<uint8_t>(idx_num);
             }
         }
         auto dref = XPLMFindDataRef(dataref.c_str());
-        auto dtype = XPLMGetDataRefTypes(dref);
-        if (dref) {
-            std::shared_ptr<Subscription> sub{
-                new Subscription(id, freq, dref, dtype, idx, from)};
-            //sub->print();
-            next_plan[freq][std::make_pair(from, id)] = sub;
-        } else {
+        if (!dref) {
             print_debug("dataref not found: %s", dataref.c_str());
+            return;
         }
+        auto sub = std::make_shared<Subscription>(id, freq, dataref, idx, from);
+        next_plan[freq][std::make_pair(from, id)] = sub;
     }
 };
 
 double get_elevation() {
     auto dref = XPLMFindDataRef("sim/flightmodel/position/elevation");
+    if (!dref) {
+        return 0.0;
+    }
     return XPLMGetDatad(dref);
 }
 
 float get_groundspeed() {
     auto dref = XPLMFindDataRef("sim/flightmodel/position/groundspeed");
+    if (!dref) {
+        return 0.0f;
+    }
     return XPLMGetDataf(dref);
 }
 
 struct TeleportEvent: public Event {
-    string id;
-    string alt;
-    string gs;
+    string fix_id;
+    float alt_ft;
+    float gs_kt;
 
-    TeleportEvent(string id, string alt, string gs): id(id), alt(alt), gs(gs) {};
+    TeleportEvent(string fix_id, float alt_ft, float gs_kt):
+        fix_id(std::move(fix_id)),
+        alt_ft(alt_ft),
+        gs_kt(gs_kt) {}
     ~TeleportEvent() override {}
 
     void handle() override {
@@ -251,40 +278,16 @@ struct TeleportEvent: public Event {
         float lat, lng, elev;
         char name[256];
         navaid_table_init();
-        auto it = navaid_table->find(id);
-        if (it != navaid_table->end()) {
+        const auto it = navaid_table.find(fix_id);
+        if (it != navaid_table.end()) {
             XPLMGetNavAidInfo(it->second, &type, &lat, &lng, &elev, nullptr, nullptr, nullptr, name, nullptr);
             print_debug("teleporting to %s(type=%d, lat=%.6f, lng=%.6f, elev=%.2f)", name, type, lat, lng, elev);
 
-            auto sim_paused_dref = XPLMFindDataRef("sim/time/paused");
-            if (sim_paused_dref != NULL) {
-                if (XPLMGetDatai(sim_paused_dref) == 0) {
-                    XPLMCommandOnce(XPLMFindCommand("sim/operation/pause_toggle"));
-                }
-            }
-
-            // Set to 65% power
-            XPLMSetDataf(XPLMFindDataRef("sim/cockpit2/engine/actuators/throttle_ratio_all"), 0.65);
-
-            size_t n;
-
-            auto alt = std::stod(this->alt, &n);
-            if (n == this->alt.length()) {
-                alt = feet_to_meter(alt);
-            } else {
-                alt = get_elevation();
-            }
-
-            auto gs = std::stof(this->gs, &n);
-            if (n != this->gs.length()) {
-                gs = mps_to_kts(get_groundspeed());
-            }
-            if (gs < 80) {
-                gs = 80;
-            }
+            const double alt_m = feet_to_meter(alt_ft);
+            const float gs = std::max(gs_kt, 80.0f);
 
             double x, y, z;
-            XPLMWorldToLocal(lat, lng, alt, &x, &y, &z);
+            XPLMWorldToLocal(lat, lng, alt_m, &x, &y, &z);
             auto local_x_dref = XPLMFindDataRef("sim/flightmodel/position/local_x");
             auto local_y_dref = XPLMFindDataRef("sim/flightmodel/position/local_y");
             auto local_z_dref = XPLMFindDataRef("sim/flightmodel/position/local_z");
@@ -292,12 +295,14 @@ struct TeleportEvent: public Event {
             auto local_vy_dref = XPLMFindDataRef("sim/flightmodel/position/local_vy");
             auto local_vz_dref = XPLMFindDataRef("sim/flightmodel/position/local_vz");
             auto psi_dref = XPLMFindDataRef("sim/flightmodel/position/psi");
+            if (!local_x_dref || !local_y_dref || !local_z_dref ||
+                !local_vx_dref || !local_vy_dref || !local_vz_dref ||
+                !psi_dref) {
+                print_debug("teleport failed: required dataref missing");
+                return;
+            }
             auto psi = XPLMGetDataf(psi_dref) * PI / 180;
             auto mps = kts_to_mps(gs);
-
-            int override = 1;
-            auto override_dref = XPLMFindDataRef("sim/operation/override/override_planepath");
-            XPLMSetDatavi(override_dref, &override, 0, 1);
 
             XPLMSetDatad(local_x_dref, x);
             XPLMSetDatad(local_y_dref, y);
@@ -306,11 +311,8 @@ struct TeleportEvent: public Event {
             XPLMSetDataf(local_vx_dref, mps * sin(psi));
             XPLMSetDataf(local_vz_dref, mps * -cos(psi));
             XPLMSetDataf(local_vy_dref, 0);
-
-            override = 0;
-            XPLMSetDatavi(override_dref, &override, 0, 1);
         } else {
-            print_debug("invalid navaid/fix ID: %s", id.c_str());
+            print_debug("invalid navaid/fix ID: %s", fix_id.c_str());
         }
     }
 };
@@ -320,45 +322,41 @@ struct EventQueue {
     std::queue<std::unique_ptr<Event>> q;
 
     void push(std::unique_ptr<Event> event) {
-        lck.lock();
+        std::lock_guard<std::mutex> lk(lck);
         q.push(std::move(event));
-        lck.unlock();
     }
 
-    std::optional<std::unique_ptr<Event>> pop() {
-        lck.lock();
+    bool pop(std::unique_ptr<Event> &event) {
+        std::lock_guard<std::mutex> lk(lck);
         if (q.empty()) {
-            lck.unlock();
-            return std::optional<std::unique_ptr<Event>>{};
+            return false;
         }
-        std::unique_ptr<Event> event = std::move(q.front());
+        event = std::move(q.front());
         q.pop();
-        lck.unlock();
-        return event;
+        return true;
     }
 };
 
 struct UDPServer {
     int sockfd;
+    std::atomic<bool> running;
     std::thread inbound_msg_loop;
-    std::thread outbound_msg_loop;
-
-    std::queue<std::pair<std::vector<uint8_t>, struct sockaddr_in>> outbound_msgs;
-    std::condition_variable outbound_cv;
-    std::mutex outbound_lock;
-    bool outbound_readable;
-    bool outbound_exit;
-    
-    static const size_t MAX_OUTBOUND_QUEUED = 1024;
+    std::mutex socket_lock;
 
     virtual void on_message(bytes_t buffer, size_t len, SocketAddr from) = 0;
 
-    UDPServer(int port): outbound_msgs(), outbound_cv(), outbound_lock(),
-                outbound_readable(false), outbound_exit(false) {
+    UDPServer(int port): sockfd(-1), running(false), socket_lock() {
         if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
             print_debug("socket creation failed");
             return;
         }
+
+        int reuse = 1;
+        setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        struct timeval tv{};
+        tv.tv_sec = 0;
+        tv.tv_usec = 200000; // 200ms recv timeout so stop() does not depend on socket shutdown behavior
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         struct sockaddr_in server_addr;
 
@@ -376,85 +374,68 @@ struct UDPServer {
         }
     }
 
-    void start() {
-        inbound_msg_loop = std::thread([this] {
+    bool start() {
+        if (sockfd < 0) {
+            fprintf(stderr, "[Loupe Flightdeck] UDP start skipped: socket is unavailable\n");
+            return false;
+        }
+        if (running.exchange(true)) {
+            return true;
+        }
+
+        const int fd = sockfd;
+
+        inbound_msg_loop = std::thread([this, fd] {
             fprintf(stderr, "[Loupe Flightdeck] inbound message loop is started\n");
             const size_t BUFFER_SIZE = 65536;
-            socklen_t addr_len = sizeof(sockaddr_in);
-            struct sockaddr_in client_addr;
             uint8_t buffer[BUFFER_SIZE];
 
-            for (;;) {
-                int n = recvfrom(sockfd, buffer, BUFFER_SIZE, 0, (struct sockaddr *)&client_addr, &addr_len);
+            for (; running.load(std::memory_order_acquire);) {
+                struct sockaddr_in client_addr{};
+                socklen_t addr_len = sizeof(client_addr);
+                int n = recvfrom(fd, buffer, BUFFER_SIZE, 0, (struct sockaddr *)&client_addr, &addr_len);
                 if (n > 0) {
                     on_message(buffer, n, client_addr);
                 } else {
+                    if (!running.load(std::memory_order_acquire)) break;
+                    if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
                     break;
                 }
             }
             fprintf(stderr, "[Loupe Flightdeck] inbound message loop ended\n");
         });
-
-        outbound_msg_loop = std::thread([this] {
-            fprintf(stderr, "[Loupe Flightdeck] outbound message loop is started\n");
-            const socklen_t addr_len = sizeof(sockaddr_in);
-            for (;;) {
-                std::unique_lock lk{outbound_lock};
-                outbound_cv.wait(lk, [this] { return outbound_readable || outbound_exit; });
-                if (outbound_exit) {
-                    lk.unlock();
-                    break;
-                }
-                while (!outbound_msgs.empty()) {
-                    auto p = std::move(outbound_msgs.front());
-                    const auto &data_msg = p.first;
-                    struct sockaddr_in &client_addr = p.second;
-                    outbound_msgs.pop();
-                    sendto(sockfd, &*data_msg.begin(), data_msg.size(),
-                        MSG_CONFIRM, (const struct sockaddr *)&client_addr, addr_len);
-                }
-                outbound_readable = false;
-                lk.unlock();
-            }
-            fprintf(stderr, "[Loupe Flightdeck] outbound message loop ended\n");
-        });
+        return true;
     }
 
-    virtual ~UDPServer() {
-        stop();
-    }
+    virtual ~UDPServer() = default;
 
     void stop() {
-        if (sockfd >= 0) {
-            print_debug("shutting down UDP Server");
-            shutdown(sockfd, SHUT_RDWR);
-            // Close after threads are joined to avoid race conditions
-            //close(sockfd);
-            //sockfd = -1;
-
-            if (inbound_msg_loop.joinable()) inbound_msg_loop.join();
-
-            outbound_lock.lock();
-            outbound_exit = true;
-            outbound_cv.notify_all();
-            outbound_lock.unlock();
-            if (outbound_msg_loop.joinable()) outbound_msg_loop.join();
-
-            close(sockfd);
+        int fd = -1;
+        running.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(socket_lock);
+            fd = sockfd;
             sockfd = -1;
         }
+
+        if (fd >= 0) {
+            print_debug("shutting down UDP Server");
+            shutdown(fd, SHUT_RDWR);
+            close(fd);
+        }
+        if (inbound_msg_loop.joinable()) inbound_msg_loop.join();
     }
 
-    void outbound(std::vector<uint8_t> &&msg, struct sockaddr_in &&addr) {
-        outbound_lock.lock();
-        if (outbound_msgs.size() < MAX_OUTBOUND_QUEUED) {
-            outbound_msgs.push({msg, addr});
-            outbound_readable = true;
-            outbound_cv.notify_all();
-        } else {
-            print_debug("dropping outbound UDP msg");
+    void outbound(const std::vector<uint8_t> &msg, const struct sockaddr_in &addr) {
+        int fd = -1;
+        {
+            std::lock_guard<std::mutex> lk(socket_lock);
+            fd = sockfd;
         }
-        outbound_lock.unlock();
+        if (fd < 0 || !running.load(std::memory_order_acquire)) {
+            return;
+        }
+        sendto(fd, msg.data(), msg.size(), 0, (const struct sockaddr *)&addr, sizeof(addr));
     }
 };
 
@@ -470,36 +451,45 @@ struct XPlaneS: public UDPServer {
     }
 
     void on_message(bytes_t buffer, size_t len, SocketAddr from) override {
-        //print_debug("got a message %lu", len);
-        size_t prefix = 0;
-        for (bytes_t ptr = buffer; ptr < buffer + len; ptr++) {
-            if (*ptr == 0) {
-                prefix = ptr - buffer;
-                break;
-            }
-        }
-        if (prefix == 4) {
-            const char *str = (const char *)buffer;
-            if (!strcmp(str, "RREF")) {
-                //print_debug("got a ref registration");
-                if (len == 4 + 1 + 4 * 2 + 400) {
-                    bytes_t base = buffer + prefix + 1;
-                    int32_t freq = le32toh(*(uint32_t *)base);
-                    int32_t id = le32toh(*(uint32_t *)(base + 4));
-                    buffer[len - 1] = 0;
-                    events.push(std::unique_ptr<Event>(
-                        new DataSubscribeEvent((const char *)base + 8, freq, id, from)));
+        constexpr size_t HEADER_LEN = 5;
+        if (len >= HEADER_LEN && std::memcmp(buffer, "RREF", 4) == 0 && buffer[4] == 0) {
+            // RREF\0 + freq(4) + id(4) + dataref(400)
+            if (len == HEADER_LEN + 8 + 400) {
+                const bytes_t base = buffer + HEADER_LEN;
+                const int32_t freq = static_cast<int32_t>(read_le_u32(base));
+                const int32_t id = static_cast<int32_t>(read_le_u32(base + 4));
+                const char *dataref_ptr = reinterpret_cast<const char *>(base + 8);
+                const size_t max_len = 400;
+                size_t dataref_len = 0;
+                while (dataref_len < max_len && dataref_ptr[dataref_len] != '\0') {
+                    dataref_len++;
                 }
-                return;
+                if (dataref_len == 0) {
+                    fprintf(stderr, "[Loupe Flightdeck] invalid RREF payload\n");
+                    return;
+                }
+                events.push(std::make_unique<DataSubscribeEvent>(
+                    string(dataref_ptr, dataref_len), freq, id, from));
             }
-            if (!strcmp(str, "CMND")) {
-                //print_debug("got a command");
-                buffer[len - 1] = 0;
-                events.push(std::unique_ptr<Event>(
-                    new CommandEvent((const char *)buffer + prefix + 1)));
-                return;
-            }
+            return;
         }
+
+        if (len > HEADER_LEN && std::memcmp(buffer, "CMND", 4) == 0 && buffer[4] == 0) {
+            const bytes_t cmd_ptr = buffer + HEADER_LEN;
+            const size_t max_len = len - HEADER_LEN;
+            size_t cmd_len = 0;
+            while (cmd_len < max_len && cmd_ptr[cmd_len] != '\0') {
+                cmd_len++;
+            }
+            if (cmd_len == 0) {
+                fprintf(stderr, "[Loupe Flightdeck] invalid CMND payload\n");
+                return;
+            }
+            events.push(std::make_unique<CommandEvent>(
+                string(reinterpret_cast<const char *>(cmd_ptr), cmd_len)));
+            return;
+        }
+
         fprintf(stderr, "[Loupe Flightdeck] invalid message header\n");
     }
 };
@@ -535,20 +525,52 @@ struct GDL90: public UDPServer {
         stop();
     }
 
+    bool has_required_drefs() const {
+        return lat_dref && lng_dref &&
+               baro_alt_dref && geo_alt_dref &&
+               gs_dref && vs_dref && trk_dref &&
+               roll_dref && pitch_dref && hdg_dref &&
+               tas_dref && ias_dref;
+    }
+
     void on_message(bytes_t buffer, size_t len, SocketAddr from) override {
         auto f = from.get_sockaddr_in();
-        string s = (const char *)buffer;
+        string s((const char *)buffer, len);
         if (s.find("ForeFlight") != string::npos && s.find("GDL90") != string::npos) {
             auto pos = s.find("\"port\":");
-            auto port = std::stoi(s.substr(pos + 7));
+            if (pos == string::npos) {
+                fprintf(stderr, "[Loupe Flightdeck] malformed ForeFlight discovery payload (port missing)\n");
+                return;
+            }
+            size_t value_start = pos + 7;
+            while (value_start < s.size() && std::isspace(static_cast<unsigned char>(s[value_start]))) {
+                value_start++;
+            }
+            size_t value_end = value_start;
+            while (value_end < s.size() && std::isdigit(static_cast<unsigned char>(s[value_end]))) {
+                value_end++;
+            }
+            if (value_start == value_end) {
+                fprintf(stderr, "[Loupe Flightdeck] malformed ForeFlight discovery payload (port invalid)\n");
+                return;
+            }
+
+            int port = 0;
+            try {
+                port = std::stoi(s.substr(value_start, value_end - value_start));
+            } catch (...) {
+                fprintf(stderr, "[Loupe Flightdeck] malformed ForeFlight discovery payload (port parse failed)\n");
+                return;
+            }
+            if (port <= 0 || port > 65535) {
+                fprintf(stderr, "[Loupe Flightdeck] malformed ForeFlight discovery payload (port out of range)\n");
+                return;
+            }
             f.sin_port = htons(port);
-            //inet_pton(AF_INET, "127.0.0.1", &f.sin_addr);
-            foreflight_addr_lock.lock();
-            foreflight_addr = f;
-            foreflight_addr_lock.unlock();
-            char addr[128];
-            inet_ntop(AF_INET, &f.sin_addr, addr, 128);
-            //print_debug("found foreflight at %s:%d", addr, ntohs(f.sin_port));
+            {
+                std::lock_guard<std::mutex> lk(foreflight_addr_lock);
+                foreflight_addr = f;
+            }
         }
     }
 
@@ -582,7 +604,7 @@ struct GDL90: public UDPServer {
         return crc;
     }
 
-    void send_msg(const bytes_t msg, size_t size) {
+    void send_msg(const bytes_t msg, size_t size, const struct sockaddr_in &addr) {
         std::vector<uint8_t> escaped{0x7e};
 
 	    uint16_t crc = crc_compute(msg, size);
@@ -598,31 +620,31 @@ struct GDL90: public UDPServer {
             escaped.push_back(b);
         }
         escaped.push_back(0x7e);
-        struct sockaddr_in addr = foreflight_addr.value();
-        outbound(std::move(escaped), std::move(addr));
+        outbound(escaped, addr);
     }
 
-    void send_heartbeat(bool pos_avail) {
+    void send_heartbeat(const struct sockaddr_in &addr, bool pos_avail) {
         uint8_t buffer[7];
         buffer[0] = 0;
         buffer[1] = ((pos_avail ? 1 : 0) << 7) | 1;
         memset(buffer + 2, 0x0, 5); // all ignored by FF
-        send_msg(buffer, sizeof(buffer));
+        send_msg(buffer, sizeof(buffer), addr);
     }
 
     void send_idmsg(
+            const struct sockaddr_in &addr,
             string name = "Loupe Flightdeck",
             uint64_t serial = 0x12345678, bool alt_msl = true) {
         uint8_t buffer[39];
         buffer[0] = 0x65;
         buffer[1] = 0;
         buffer[2] = 1;
-        *((uint64_t *)(buffer + 3)) = htobe64(serial);
+        write_be_u64(buffer + 3, serial);
         name += string(16, ' ');
         memmove((char *)(buffer + 11), name.c_str(), 8);
         memmove((char *)(buffer + 19), name.c_str(), 16);
-        *((uint32_t *)(buffer + 35)) = htobe32(alt_msl ? 1 : 0);
-        send_msg(buffer, sizeof(buffer));
+        write_be_u32(buffer + 35, alt_msl ? 1 : 0);
+        send_msg(buffer, sizeof(buffer), addr);
     }
 
     void fill_traffic_report_payload(
@@ -668,117 +690,175 @@ struct GDL90: public UDPServer {
     }
 
     void send_ownship_report(
+            const struct sockaddr_in &addr,
             float lat, float lng, float baro_alt,
             std::optional<float> gs, float vs, float trk,
-            uint8_t misc = 0x9, uint32_t addr = 0x000000, string callsign = "N123AB",
+            uint8_t misc = 0x9, uint32_t icao_addr = 0x000000, string callsign = "N123AB",
             uint8_t nic_acc = 0xbb, uint8_t emitter = 0x1, uint8_t emergency = 0) {
         uint8_t buffer[28];
         buffer[0] = 10;
         fill_traffic_report_payload(buffer + 1, lat, lng, baro_alt,
-                gs, vs, trk, misc, addr,  callsign, nic_acc, emitter, emergency);
-        send_msg(buffer, sizeof(buffer)); // ownship
+                gs, vs, trk, misc, icao_addr, callsign, nic_acc, emitter, emergency);
+        send_msg(buffer, sizeof(buffer), addr); // ownship
         //buffer[0] = 20;
         //send_msg(buffer, sizeof(buffer)); // also send as a traffic
     }
 
-    void send_ownship_geo_alt(float alt) {
+    void send_ownship_geo_alt(const struct sockaddr_in &addr, float alt) {
         uint8_t buffer[5];
         buffer[0] = 11;
         auto alt_ = int16_t(alt / 5);
-        *(uint16_t *)(buffer + 1) = htobe16(alt_);
-        *(uint16_t *)(buffer + 3) = htobe16(0x0003);
-        send_msg(buffer, sizeof(buffer));
+        write_be_u16(buffer + 1, static_cast<uint16_t>(alt_));
+        write_be_u16(buffer + 3, 0x0003);
+        send_msg(buffer, sizeof(buffer), addr);
     }
 
-    void send_ahrs_message(float roll, float pitch, float hdg, float ias, float tas, bool mag = true) {
+    void send_ahrs_message(const struct sockaddr_in &addr, float roll, float pitch, float hdg, float ias, float tas, bool mag = true) {
         uint8_t buffer[12];
         buffer[0] = 0x65;
         buffer[1] = 0x1;
         auto roll_ = int32_t(roll * 10);
         roll_ = roll_ < -0x8000 ? -0x8000 : (roll_ > 0x7fff ? 0x7fff : roll_);
-        *(int16_t *)(buffer + 2) = htobe16(int16_t(roll_));
+        write_be_u16(buffer + 2, static_cast<uint16_t>(int16_t(roll_)));
 
         auto pitch_ = int32_t(pitch * 10);
         pitch_ = pitch_ < -0x8000 ? -0x8000 : (pitch_ > 0x7fff ? 0x7fff : pitch_);
-        *(int16_t *)(buffer + 4) = htobe16(int16_t(pitch_));
+        write_be_u16(buffer + 4, static_cast<uint16_t>(int16_t(pitch_)));
 
         auto hdg_ = int32_t(hdg * 10);
         hdg_ = hdg_ < -3600 ? -3600 : (hdg_ > 3600 ? 3600 : hdg_);
         if (hdg_ < 0) hdg_ = (0x10000 + hdg_) & 0xffff;
-        *(uint16_t *)(buffer + 6) = htobe16(uint16_t(hdg_ & 0x7fff) | ((mag ? 1 : 0) << 15));
+        write_be_u16(buffer + 6, static_cast<uint16_t>(uint16_t(hdg_ & 0x7fff) | ((mag ? 1 : 0) << 15)));
 
         auto ias_ = uint16_t(ias < 0 ? 0 : (ias > 0x7fff ? 0x7fff : ias));
-        *(uint16_t *)(buffer + 8) = htobe16(ias_);
+        write_be_u16(buffer + 8, ias_);
 
         auto tas_ = uint16_t(tas < 0 ? 0 : (tas > 0x7fff ? 0x7fff : tas));
-        *(uint16_t *)(buffer + 10) = htobe16(tas_);
-        send_msg(buffer, sizeof(buffer));
+        write_be_u16(buffer + 10, tas_);
+        send_msg(buffer, sizeof(buffer), addr);
     }
 
     void update_1hz() {
+        if (!has_required_drefs()) {
+            return;
+        }
         float lat = XPLMGetDatad(lat_dref);
         float lng = XPLMGetDatad(lng_dref);
-        float baro_alt = XPLMGetDataf(baro_alt_dref); // FIXME: use 29.92 as the reference
+        float baro_alt = XPLMGetDataf(baro_alt_dref); // Reported indicated altitude from sim.
         float geo_alt = meter_to_feet(XPLMGetDatad(geo_alt_dref));
         float gs = XPLMGetDataf(gs_dref) * 1.94384;
         float vs = XPLMGetDataf(vs_dref);
         float trk = XPLMGetDataf(trk_dref);
-        foreflight_addr_lock.lock();
-        if (foreflight_addr.has_value()) {
-            send_heartbeat(true);
-            send_ownship_report(lat, lng, baro_alt,
-                                std::optional(gs), vs, trk);
-            send_ownship_geo_alt(geo_alt);
-            send_idmsg();
-            //print_debug("GDL90 frames sent lat=%.4f lng=%.4f baro_alt=%.0f geo_alt=%.0f gs=%.0f vs=%.0f trk=%0.f", lat, lng, baro_alt, geo_alt, gs, vs, trk);
+        std::optional<struct sockaddr_in> target;
+        {
+            std::lock_guard<std::mutex> lk(foreflight_addr_lock);
+            target = foreflight_addr;
         }
-        foreflight_addr_lock.unlock();
+        if (!target.has_value()) return;
+
+        send_heartbeat(*target, true);
+        send_ownship_report(*target, lat, lng, baro_alt, std::optional(gs), vs, trk);
+        send_ownship_geo_alt(*target, geo_alt);
+        send_idmsg(*target);
     }
 
     void update_ahrs() {
+        if (!has_required_drefs()) {
+            return;
+        }
         float roll = XPLMGetDataf(roll_dref);
         float pitch = XPLMGetDataf(pitch_dref);
         float hdg = XPLMGetDataf(hdg_dref);
         float ias = XPLMGetDataf(ias_dref);
         float tas = XPLMGetDataf(tas_dref);
-        foreflight_addr_lock.lock();
-        if (foreflight_addr.has_value()) {
-            send_ahrs_message(roll, pitch, hdg, ias, tas);
+        std::optional<struct sockaddr_in> target;
+        {
+            std::lock_guard<std::mutex> lk(foreflight_addr_lock);
+            target = foreflight_addr;
         }
-        foreflight_addr_lock.unlock();
+        if (!target.has_value()) return;
+
+        send_ahrs_message(*target, roll, pitch, hdg, ias, tas);
     }
 };
 
 uint16_t GDL90::crc16_table[256];
 
-XPlaneS *xps = nullptr;
-GDL90 *gdl90 = nullptr;
-XPLMFlightLoopID ctrl_loop_id;
-XPLMFlightLoopID data_loop_id;
-XPLMFlightLoopID gdl90_loop_id;
-XPLMCommandRef ir_training_cmd;
-XPLMCommandRef throttle_full_cmd;
-XPLMCommandRef prop_full_cmd;
+std::unique_ptr<XPlaneS> xps = nullptr;
+std::unique_ptr<GDL90> gdl90 = nullptr;
+XPLMFlightLoopID ctrl_loop_id = nullptr;
+XPLMFlightLoopID data_loop_id = nullptr;
+XPLMFlightLoopID gdl90_loop_id = nullptr;
+XPLMCommandRef ir_training_cmd = nullptr;
+XPLMCommandRef throttle_full_cmd = nullptr;
+XPLMCommandRef prop_full_cmd = nullptr;
+static bool plugin_enabled = false;
+static bool command_handlers_registered = false;
 
-float ctrl_loop(float elapsed, float, int, void *) {
+static bool read_subscription_value(const Subscription &sub, float &value_out) {
+    XPLMDataRef dref = XPLMFindDataRef(sub.dataref_path.c_str());
+    if (!dref) {
+        return false;
+    }
+
+    const XPLMDataTypeID dtype = XPLMGetDataRefTypes(dref);
+    if (sub.idx.has_value()) {
+        const int idx = sub.idx.value();
+        if (dtype & xplmType_IntArray) {
+            int value = 0;
+            XPLMGetDatavi(dref, &value, idx, 1);
+            value_out = static_cast<float>(value);
+            return true;
+        }
+        if (dtype & xplmType_FloatArray) {
+            XPLMGetDatavf(dref, &value_out, idx, 1);
+            return true;
+        }
+        return false;
+    }
+
+    if (dtype & xplmType_Float) {
+        value_out = XPLMGetDataf(dref);
+        return true;
+    }
+    if (dtype & xplmType_Double) {
+        value_out = static_cast<float>(XPLMGetDatad(dref));
+        return true;
+    }
+    if (dtype & xplmType_Int) {
+        value_out = static_cast<float>(XPLMGetDatai(dref));
+        return true;
+    }
+    return false;
+}
+
+float ctrl_loop(float, float, int, void *) {
+    if (!xps) {
+        return 0;
+    }
     for (;;) {
-        auto ret = xps->events.pop();
-        if (!ret.has_value()) {
+        std::unique_ptr<Event> event;
+        if (!xps->events.pop(event)) {
             break;
         }
-        auto event = std::move(ret.value());
         event->handle();
     }
     return 0.01;
 }
 
 float data_loop(float, float, int, void *) {
+    if (!xps) {
+        return 0;
+    }
     float elapsed = XPLMGetElapsedTime();
     std::unordered_map<SocketAddr, std::vector<std::pair<int32_t, std::shared_ptr<Subscription>>>> expired;
     while (!stops.empty() && elapsed + EPS > stops.front().first) {
         auto id = std::move(stops.front().second);
         stops.pop();
-        expired[id.first].push_back(std::make_pair(id.second, id2sub[id]));
+        const auto it = id2sub.find(id);
+        if (it != id2sub.end()) {
+            expired[id.first].push_back(std::make_pair(id.second, it->second));
+        }
     }
     if (!expired.empty() && xps) {
         static const auto prefix = string("RREF,");
@@ -789,38 +869,25 @@ float data_loop(float, float, int, void *) {
             data_msg.resize(prefix.length() + 8 * v.size());
             bytes_t ptr = &*data_msg.begin() + prefix.length();
             for (const auto &p: v) {
-                *(uint32_t *)ptr = htole32(p.first);
+                write_le_u32(ptr, static_cast<uint32_t>(p.first));
                 ptr += 4;
-                float v = 0;
+                float value = 0.0f;
                 const auto &sub = p.second;
-                if (sub->idx.has_value()) {
-                    auto i = sub->idx.value();
-                    if (sub->datatype == xplmType_IntArray) {
-                        int vv;
-                        XPLMGetDatavi(sub->dataref, &vv, i, 1);
-                        v = vv;
-                    } else if (sub->datatype == xplmType_FloatArray) {
-                        XPLMGetDatavf(sub->dataref, &v, i, 1);
-                    }
-                } else {
-                    if (sub->datatype == xplmType_Int) {
-                        v = XPLMGetDatai(sub->dataref);
-                    } else if (sub->datatype == xplmType_Float) {
-                        v = XPLMGetDataf(sub->dataref);
-                    } else if (sub->datatype == xplmType_Double) {
-                        v = XPLMGetDatad(sub->dataref);
-                    }
+                if (sub) {
+                    read_subscription_value(*sub, value);
                 }
-                uint32_t *vptr = (uint32_t *)&v;
-                uint32_t encoded = htole32(*vptr);
-                *(uint32_t *)ptr = encoded;
+                uint32_t raw_v;
+                std::memcpy(&raw_v, &value, sizeof(raw_v));
+                uint32_t encoded = htole32(raw_v);
+                std::memcpy(ptr, &encoded, sizeof(encoded));
                 ptr += 4;
             }
-            xps->outbound(std::move(data_msg), a.get_sockaddr_in());
+            xps->outbound(data_msg, a.get_sockaddr_in());
         }
     }
     if (stops.empty()) {
         // load the schedule for the next second.
+        id2sub.clear();
         std::vector<std::pair<float, subid_t>> all;
         for (const auto &[freq, m]: next_plan) {
             int f = std::max(std::min(freq, 100), 0);
@@ -850,6 +917,9 @@ float data_loop(float, float, int, void *) {
 }
 
 float gdl90_loop(float, float, int, void *) {
+    if (!gdl90) {
+        return 0;
+    }
     static const int main_freq = 1;
     static const int ahrs_factor = 10;
     static const float interval = 1.0 / (main_freq * ahrs_factor);
@@ -867,7 +937,9 @@ int set_throttle_full(XPLMCommandRef, XPLMCommandPhase phase, void *) {
         return 1;
     }
     XPLMDataRef dref = XPLMFindDataRef("sim/cockpit2/engine/actuators/throttle_ratio_all");
-    XPLMSetDataf(dref, 1.0f);
+    if (dref) {
+        XPLMSetDataf(dref, 1.0f);
+    }
     return 0;
 }
 
@@ -876,44 +948,71 @@ int set_prop_full(XPLMCommandRef, XPLMCommandPhase phase, void *) {
         return 1;
     }
     XPLMDataRef dref = XPLMFindDataRef("sim/cockpit2/engine/actuators/prop_ratio_all");
-    XPLMSetDataf(dref, 1.0f);
+    if (dref) {
+        XPLMSetDataf(dref, 1.0f);
+    }
     return 0;
 }
 
+static float foggle_orig_cloud_data[9];
+static XPLMDataRef foggle_cloud_drefs[9];
+static bool foggles_on = false;
+
+static void foggles_reset() {
+    if (foggles_on) {
+        print_debug("resetting foggles (plugin disabled)...");
+        for (int i = 0; i < 9; i++) {
+            if (foggle_cloud_drefs[i]) XPLMSetDataf(foggle_cloud_drefs[i], foggle_orig_cloud_data[i]);
+        }
+        XPLMCommandRef cmd_ref = XPLMFindCommand("sim/GPS/g1000n1_popup");
+        if(cmd_ref) XPLMCommandOnce(cmd_ref);
+        cmd_ref = XPLMFindCommand("sim/GPS/g1000n3_popup");
+        if(cmd_ref) XPLMCommandOnce(cmd_ref);
+        foggles_on = false;
+    }
+}
+
 int toggle_ir_training(XPLMCommandRef, XPLMCommandPhase phase, void *) {
-    static float orig_cloud_data[9];
     if (phase != xplm_CommandBegin) {
         return 1;
     }
     XPLMCommandRef cmd_ref = XPLMFindCommand("sim/GPS/g1000n1_popup");
-    XPLMCommandOnce(cmd_ref);
+    if (cmd_ref) XPLMCommandOnce(cmd_ref);
     cmd_ref = XPLMFindCommand("sim/GPS/g1000n3_popup");
-    XPLMCommandOnce(cmd_ref);
+    if (cmd_ref) XPLMCommandOnce(cmd_ref);
+
     static const float cloud_ir[9] = {0.0, 10000.0, 11000.0, 10000.0, 11000.0, 21000.0, 6, 6, 6};
-    static XPLMDataRef cloud_drefs[9];
-    static bool foggles_on = false;
+
+    // Initialize drefs if needed (idempotent)
     for (int i = 0; i < 3; i++) {
-        static char buff[64];
+        char buff[64];
         sprintf(buff, "sim/weather/cloud_base_msl_m[%d]", i);
-        cloud_drefs[i] = XPLMFindDataRef(buff);
+        foggle_cloud_drefs[i] = XPLMFindDataRef(buff);
         sprintf(buff, "sim/weather/cloud_tops_msl_m[%d]", i);
-        cloud_drefs[i + 3] = XPLMFindDataRef(buff);
+        foggle_cloud_drefs[i + 3] = XPLMFindDataRef(buff);
         sprintf(buff, "sim/weather/cloud_coverage[%d]", i);
-        cloud_drefs[i + 6] = XPLMFindDataRef(buff);
+        foggle_cloud_drefs[i + 6] = XPLMFindDataRef(buff);
     }
+
     if (foggles_on) {
         print_debug("foggles off...");
         for (int i = 0; i < 9; i++) {
-            XPLMSetDataf(cloud_drefs[i], orig_cloud_data[i]);
+            if (foggle_cloud_drefs[i]) {
+                XPLMSetDataf(foggle_cloud_drefs[i], foggle_orig_cloud_data[i]);
+            }
         }
     } else {
-        bool paused = XPLMGetDatai(XPLMFindDataRef("sim/time/sim_speed")) == 0;
+        auto sim_speed_dref = XPLMFindDataRef("sim/time/sim_speed");
+        bool paused = sim_speed_dref ? (XPLMGetDatai(sim_speed_dref) == 0) : false;
         print_debug("foggles on...");
         for (int i = 0; i < 9; i++) {
-            if (!paused) {
-                orig_cloud_data[i] = XPLMGetDataf(cloud_drefs[i]);
+            if (!foggle_cloud_drefs[i]) {
+                continue;
             }
-            XPLMSetDataf(cloud_drefs[i], cloud_ir[i]);
+            if (!paused) {
+                foggle_orig_cloud_data[i] = XPLMGetDataf(foggle_cloud_drefs[i]);
+            }
+            XPLMSetDataf(foggle_cloud_drefs[i], cloud_ir[i]);
         }
     }
     foggles_on ^= 1;
@@ -926,17 +1025,34 @@ float alt_val = 0.0f;
 float gs_val = 0.0f;
 
 int teleport_window_on_mouse_click(XPLMWindowID id, int x, int y, XPLMMouseStatus status, void *refcon) {
+    if (!plugin_enabled) return 0;
     if (status == xplm_MouseDown) {
         XPLMTakeKeyboardFocus(id);
     }
     return XPImGui::HandleMouseClick(id, x, y, status, refcon);
 }
 
+int teleport_window_on_right_click(XPLMWindowID, int, int, XPLMMouseStatus, void *) {
+    if (!plugin_enabled) return 0;
+    return 0;
+}
+
+int teleport_window_on_mouse_wheel(XPLMWindowID, int, int, int, int, void *) {
+    if (!plugin_enabled) return 0;
+    return 0;
+}
+
+XPLMCursorStatus teleport_window_on_cursor(XPLMWindowID, int, int, void *) {
+    return xplm_CursorDefault;
+}
+
 void teleport_window_on_keyboard(XPLMWindowID id, char key, XPLMKeyFlags flag, char virtualKey, void *refcon, int losing_focus) {
+    if (!plugin_enabled) return;
     XPImGui::HandleKey(id, key, flag, virtualKey, refcon, losing_focus);
 }
 
 void teleport_window_on_draw(XPLMWindowID id, void* refcon) {
+    if (!plugin_enabled) return;
     if (!XPImGui::NewFrame(id)) return;
 
     // Create a fullscreen window inside the X-Plane window
@@ -964,30 +1080,32 @@ void teleport_window_on_draw(XPLMWindowID id, void* refcon) {
     ImGui::Spacing();
     
     if (ImGui::Button("Go!", ImVec2(120, 35))) {
-        // Trigger Teleport Event
         string id_str(fix_buffer);
-        string alt_str = std::to_string(alt_val);
-        string gs_str = std::to_string(gs_val);
-        xps->events.push(std::unique_ptr<Event>(new TeleportEvent(id_str, alt_str, gs_str)));
+        if (xps) {
+            xps->events.push(std::make_unique<TeleportEvent>(id_str, alt_val, gs_val));
+        }
     }
 
     ImGui::End();
     XPImGui::Render();
 }
 
-void menu_handler(void *inMenuRef, void *inItemRef) {
+void menu_handler(void *, void *inItemRef) {
+    if (!plugin_enabled) return;
     auto id = uintptr_t(inItemRef);
     switch (id) {
         case 0: {
             XPLMCommandRef cmd_ref = XPLMFindCommand("lfd/toggle_imc_foggles");
-            XPLMCommandOnce(cmd_ref);
+            if (cmd_ref) XPLMCommandOnce(cmd_ref);
         }
         break;
         case 1: {
+            if (!xps) return; // Plugin disabled check
             if (!teleport_window) {
+                XPImGui::Init();
                 int x0 = 500, y0 = 500;
                 int w = 300, h = 250; // Slightly taller for ImGui spacing
-                XPLMCreateWindow_t win;
+                XPLMCreateWindow_t win{};
                 win.structSize = sizeof(win);
                 win.left = x0;
                 win.bottom = y0 - h;
@@ -996,16 +1114,22 @@ void menu_handler(void *inMenuRef, void *inItemRef) {
                 win.visible = 1;
                 win.drawWindowFunc = teleport_window_on_draw;
                 win.handleMouseClickFunc = teleport_window_on_mouse_click;
-                win.handleRightClickFunc = nullptr;
-                win.handleMouseWheelFunc = nullptr;
+                win.handleRightClickFunc = teleport_window_on_right_click;
+                win.handleMouseWheelFunc = teleport_window_on_mouse_wheel;
                 win.handleKeyFunc = teleport_window_on_keyboard;
-                win.handleCursorFunc = nullptr;
+                win.handleCursorFunc = teleport_window_on_cursor;
                 win.refcon = nullptr;
                 win.layer = xplm_WindowLayerFloatingWindows;
                 teleport_window = XPLMCreateWindowEx(&win);
+                if (!teleport_window) {
+                    print_debug("failed to create teleport window");
+                    XPImGui::Shutdown();
+                    return;
+                }
                 XPLMSetWindowPositioningMode(teleport_window, xplm_WindowPositionFree, -1);
                 XPLMSetWindowResizingLimits(teleport_window, w, h, w, h);
                 XPLMSetWindowTitle(teleport_window, "Teleport To");
+                XPLMTakeKeyboardFocus(teleport_window);
                 
                 // Initialize defaults
                 if (strlen(fix_buffer) == 0) strcpy(fix_buffer, "KSEA");
@@ -1013,16 +1137,78 @@ void menu_handler(void *inMenuRef, void *inItemRef) {
                 gs_val = mps_to_kts(std::max(0.0f, get_groundspeed()));
             } else {
                 XPLMSetWindowIsVisible(teleport_window, 1);
+                XPLMTakeKeyboardFocus(teleport_window);
             }
         }
-        break;
-        case 2: XPLMReloadPlugins();
         break;
     }
 }
 
-XPLMMenuID menu_id;
-int menu_idx;
+XPLMMenuID menu_id = nullptr;
+int menu_idx = -1;
+
+static void unregister_command_handlers() {
+    if (!command_handlers_registered) {
+        return;
+    }
+    if (ir_training_cmd) XPLMUnregisterCommandHandler(ir_training_cmd, toggle_ir_training, false, nullptr);
+    if (throttle_full_cmd) XPLMUnregisterCommandHandler(throttle_full_cmd, set_throttle_full, false, nullptr);
+    if (prop_full_cmd) XPLMUnregisterCommandHandler(prop_full_cmd, set_prop_full, false, nullptr);
+    command_handlers_registered = false;
+}
+
+static void destroy_flight_loops() {
+    if (ctrl_loop_id) {
+        XPLMDestroyFlightLoop(ctrl_loop_id);
+        ctrl_loop_id = nullptr;
+    }
+    if (data_loop_id) {
+        XPLMDestroyFlightLoop(data_loop_id);
+        data_loop_id = nullptr;
+    }
+    if (gdl90_loop_id) {
+        XPLMDestroyFlightLoop(gdl90_loop_id);
+        gdl90_loop_id = nullptr;
+    }
+}
+
+static void destroy_teleport_window() {
+    if (teleport_window) {
+        XPLMSetWindowIsVisible(teleport_window, 0);
+        XPLMDestroyWindow(teleport_window);
+        teleport_window = 0;
+    }
+    XPImGui::Shutdown();
+}
+
+static void stop_udp_servers() {
+    if (xps) {
+        xps.reset();
+        print_debug("XPS is disabled");
+    }
+    if (gdl90) {
+        gdl90.reset();
+        print_debug("GDL90 is disabled");
+    }
+}
+
+static void clear_runtime_state() {
+    std::queue<std::pair<float, subid_t>> empty_stops;
+    std::swap(stops, empty_stops);
+    id2sub.clear();
+    next_plan.clear();
+    navaid_table_reset();
+}
+
+static void cleanup_plugin_runtime() {
+    plugin_enabled = false;
+    unregister_command_handlers();
+    foggles_reset();
+    destroy_flight_loops();
+    destroy_teleport_window();
+    stop_udp_servers();
+    clear_runtime_state();
+}
 
 PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc) {
     strcpy(outName, "Loupe Flightdeck");
@@ -1030,33 +1216,69 @@ PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc) {
     strcpy(outDesc, "A plugin that reimplements X-Plane's basic UDP API and GDL90 support.");
 
     menu_idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "Loupe Flightdeck", 0, 1);
+    if (menu_idx < 0) {
+        print_debug("failed to append plugin menu item");
+        return 0;
+    }
     menu_id = XPLMCreateMenu(
             "Loupe Flightdeck",
             XPLMFindPluginsMenu(),
             menu_idx,
             menu_handler,
             0);
+    if (!menu_id) {
+        print_debug("failed to create plugin menu");
+        XPLMRemoveMenuItem(XPLMFindPluginsMenu(), menu_idx);
+        menu_idx = -1;
+        return 0;
+    }
 
     XPLMAppendMenuItem(menu_id, "Toggle Foggles", (void *)0, 1);
     XPLMAppendMenuItem(menu_id, "Teleport to Fix", (void *)1, 1);
-    XPLMAppendMenuItem(menu_id, "Reload Plugins", (void *)2, 1);
     
+    ir_training_cmd = XPLMCreateCommand(
+            "lfd/toggle_imc_foggles",
+            "Toggle IR training mode. This will toggle the outside vision (IMC and back to the original condition) and also toggle the G1000 PFD/MFD display.");
+    throttle_full_cmd = XPLMCreateCommand(
+            "lfd/throttle_full",
+            "Set throttle to full (for all engines).");
+    prop_full_cmd = XPLMCreateCommand(
+            "lfd/prop_full",
+            "Set prop to full (for all engines).");
+
     return 1;
 }
 
 PLUGIN_API void	XPluginStop() {
-    XPLMRemoveMenuItem(XPLMFindPluginsMenu(), menu_idx);
-    XPLMDestroyMenu(menu_id);
+    cleanup_plugin_runtime();
+    if (menu_id) {
+        XPLMDestroyMenu(menu_id);
+        menu_id = nullptr;
+    }
+    if (menu_idx >= 0) {
+        XPLMRemoveMenuItem(XPLMFindPluginsMenu(), menu_idx);
+        menu_idx = -1;
+    }
 }
 
 PLUGIN_API int XPluginEnable() {
-    XPImGui::Init();
+    if (plugin_enabled) return 1;
+    // Enabling may be retried after a partial failure. Always start from a clean runtime state.
+    cleanup_plugin_runtime();
     GDL90::crc_init();
 
-    xps = new XPlaneS();
-    xps->start();
-    gdl90 = new GDL90();
-    gdl90->start();
+    xps = std::make_unique<XPlaneS>();
+    if (!xps->start()) {
+        print_debug("failed to start X-Plane UDP server");
+        cleanup_plugin_runtime();
+        return 0;
+    }
+    gdl90 = std::make_unique<GDL90>();
+    if (!gdl90->start()) {
+        print_debug("failed to start GDL90 UDP server");
+        cleanup_plugin_runtime();
+        return 0;
+    }
 
     XPLMCreateFlightLoop_t loop_cfg;
     loop_cfg.structSize = sizeof(XPLMCreateFlightLoop_t);
@@ -1064,71 +1286,42 @@ PLUGIN_API int XPluginEnable() {
     loop_cfg.refcon = nullptr;
     loop_cfg.callbackFunc = ctrl_loop;
     ctrl_loop_id = XPLMCreateFlightLoop(&loop_cfg);
+    if (!ctrl_loop_id) {
+        print_debug("failed to create ctrl flight loop");
+        cleanup_plugin_runtime();
+        return 0;
+    }
     XPLMScheduleFlightLoop(ctrl_loop_id, -1, 1);
 
     loop_cfg.callbackFunc = data_loop;
     data_loop_id = XPLMCreateFlightLoop(&loop_cfg);
+    if (!data_loop_id) {
+        print_debug("failed to create data flight loop");
+        cleanup_plugin_runtime();
+        return 0;
+    }
     XPLMScheduleFlightLoop(data_loop_id, -1, 1);
 
     loop_cfg.callbackFunc = gdl90_loop;
     gdl90_loop_id = XPLMCreateFlightLoop(&loop_cfg);
+    if (!gdl90_loop_id) {
+        print_debug("failed to create GDL90 flight loop");
+        cleanup_plugin_runtime();
+        return 0;
+    }
     XPLMScheduleFlightLoop(gdl90_loop_id, -1, 1);
 
-    ir_training_cmd = XPLMCreateCommand(
-            "lfd/toggle_imc_foggles",
-            "Toggle IR training mode. This will toggle the outside vision (IMC and back to the original condition) and also toggle the G1000 PFD/MFD display.");
-    XPLMRegisterCommandHandler(ir_training_cmd, toggle_ir_training, false, nullptr);
-    throttle_full_cmd = XPLMCreateCommand(
-            "lfd/throttle_full",
-            "Set throttle to full (for all engines).");
-    XPLMRegisterCommandHandler(throttle_full_cmd, set_throttle_full, false, nullptr);
-    prop_full_cmd = XPLMCreateCommand(
-            "lfd/prop_full",
-            "Set prop to full (for all engines).");
-    XPLMRegisterCommandHandler(prop_full_cmd, set_prop_full, false, nullptr);
+    if (ir_training_cmd) XPLMRegisterCommandHandler(ir_training_cmd, toggle_ir_training, false, nullptr);
+    if (throttle_full_cmd) XPLMRegisterCommandHandler(throttle_full_cmd, set_throttle_full, false, nullptr);
+    if (prop_full_cmd) XPLMRegisterCommandHandler(prop_full_cmd, set_prop_full, false, nullptr);
+    command_handlers_registered = true;
 
+    plugin_enabled = true;
     return 1;
 }
 
 PLUGIN_API void XPluginDisable() {
-    XPLMUnregisterCommandHandler(ir_training_cmd, toggle_ir_training, false, nullptr);
-    XPLMUnregisterCommandHandler(throttle_full_cmd, set_throttle_full, false, nullptr);
-    XPLMUnregisterCommandHandler(prop_full_cmd, set_prop_full, false, nullptr);
-
-    XPLMDestroyFlightLoop(ctrl_loop_id);
-    XPLMDestroyFlightLoop(data_loop_id);
-    XPLMDestroyFlightLoop(gdl90_loop_id);
-
-    if (teleport_window) {
-        XPLMDestroyWindow(teleport_window);
-        teleport_window = 0;
-    }
-
-    if (xps) {
-        delete xps;
-        xps = nullptr;
-    } else {
-        print_debug("XP server should not be nullptr!");
-    }
-    print_debug("XPS is disabled");
-    if (gdl90) {
-        delete gdl90;
-        gdl90 = nullptr;
-    } else {
-        print_debug("GDL90 server should not be nullptr!");
-    }
-    print_debug("GDL90 is disabled");
-    
-    // Clear global containers
-    std::queue<std::pair<float, subid_t>> empty_stops;
-    std::swap(stops, empty_stops);
-    id2sub.clear();
-    next_plan.clear();
-    
-    if (navaid_table) {
-        navaid_table->clear();
-        navaid_table.reset();
-    }
+    cleanup_plugin_runtime();
 }
 
 PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int msg, void*) {}
